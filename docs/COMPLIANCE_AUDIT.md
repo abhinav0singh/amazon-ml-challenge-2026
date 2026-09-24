@@ -126,7 +126,7 @@ These numbers were measured this session directly from the dataset files (`awk` 
 |---|---|---|
 | Train S1 entities | 2,206,822 | |
 | Train S2 + S3 records | 10,320,219 | |
-| Test S1 entities | 1,732,545 | Every one needs a row. |
+| Test S1 entities | 1,732,544 | Every one needs a row. |
 | Test S2 + S3 records | 9,969,589 | |
 | Train countries | US 1,323,633 · India 883,188 | No France, as stated. |
 | **Test countries (S1)** | **US 663,106 · India 809,986 · France 259,452** | **France is 15.0 % of test S1, not a third.** LOCO still matters, but it is worth 15 % of the score, not 33 %. |
@@ -209,7 +209,7 @@ Before **every** leaderboard upload:
 
 - [ ] `python src/metric.py` prints `metric OK: example = 0.714`
 - [ ] The official validator passes on the actual files being uploaded, **with `--check-ids`**
-- [ ] Row count of `matching_results.tsv` = 1,732,546 (1,732,545 entities + header)
+- [ ] Row count of `matching_results.tsv` = 1,732,545 lines (1,732,544 entities + header)
 - [ ] The number quoted as "CV" came from `cross_fitted_score`, not `tune`
 - [ ] Ledger row added to `STATUS.md` §6 **and** the git tag created, **before** uploading
 - [ ] A copy of `output/` saved to `submissions/<tag>/`
