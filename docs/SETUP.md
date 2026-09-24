@@ -80,4 +80,4 @@ git add -A; git commit -m "..."; git push
 - [ ] your change ran end to end at least once
 - [ ] one row added to `STATUS.md` §5 (experiment log)
 - [ ] one line added to `STATUS.md` §8 (doc notes)
-- [ ] nothing under `data/`, `work/`, or `output/` is staged
+- [ ] nothing under data/, work/, or output/ is staged — except work/folds.csv, which is force-added once by P1 and pulled by everyone else (see AGENTS.md §4). Don't add anything else under work/.
