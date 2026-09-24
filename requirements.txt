@@ -1,1 +1,34 @@
-# Add pinned package versions here
+# Pinned for reproducibility — per the "pipeline fragility" failure mode,
+# we need to be able to rebuild our exact environment at hour 70, not guess.
+# Edit ONLY if the problem statement needs something not listed here
+# (e.g. a specific NLP/vision library) — commit that change immediately
+# and tell the team, since an unpinned dependency breaks reproducibility.
+
+# Core
+numpy==1.26.4
+pandas==2.2.2
+scipy==1.13.0
+
+# Modeling — the three diverse learners per the ensembling strategy
+scikit-learn==1.5.0
+xgboost==2.0.3
+lightgbm==4.3.0
+catboost==1.2.5
+
+# Optional but likely needed
+optuna==3.6.1          # only for LATE-stage tuning, not early — see ml_engineer_prompt.md
+imbalanced-learn==0.12.3   # if target is imbalanced (StratifiedKFold territory)
+
+# NLP / vision — uncomment only if the problem statement needs it
+# sentence-transformers==3.0.1
+# torch==2.3.1
+
+# EDA / utility
+matplotlib==3.9.0
+seaborn==0.13.2
+jupyter==1.0.0
+ipykernel==6.29.4
+
+# AWS (per the prep session — SageMaker SDK v3)
+sagemaker==2.224.1
+boto3==1.34.131
