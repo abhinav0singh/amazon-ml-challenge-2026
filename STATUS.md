@@ -65,9 +65,22 @@ Only **P1** uploads to the portal, from one device (simultaneous logins can term
 
 Recall ceiling = share of true pairs that survive blocking. Target ≥ 0.98 with a manageable number of candidates per S1.
 
-| Ver | Method | Recall ceiling | Avg cands / S1 | Total pairs | Runtime | Notes |
-|---|---|---|---|---|---|---|
-| B0 | | | | | | |
+**All rows below are SAMPLED runs, not full scale.** Sampling keeps the real S2/S3-per-S1 density but shrinks the haystack, so these ceilings are optimistic. No full-scale blocking run has completed yet.
+
+| Ver | Method | Sample | Recall ceiling | Entity cover | Avg cands / S1 | Runtime | Notes |
+|---|---|---|---|---|---|---|---|
+| B0 | dense top-k, 3 TF-IDF views | 2,000 | 0.9983 | 0.9940 | 24.90 | 4 s | original; infeasible at scale |
+| B1 | **sparse top-k**, max_df 0.1 | 2,000 | 0.9986 | 0.9950 | 24.85 | 2 s | no densification; drops zero-sim padding |
+| B1 | sparse top-k, max_df 0.1 | 10,000 | 0.9948 | 0.9841 | 26.17 | 16 s | |
+| B1 | sparse top-k, max_df 0.1 | 40,000 | 0.9897 | 0.9697 | 27.12 | 133 s | |
+| B1 | sparse top-k, **no pruning** | 40,000 | 0.9894 | 0.9683 | 27.07 | 241 s | pruning at 0.1 is free |
+| B1 | sparse top-k, max_df 0.01 | 40,000 | 0.9842 | 0.9551 | 27.27 | 45 s | **current default**, provisional |
+| B1 | sparse top-k, max_df 0.001 | 40,000 | 0.9495 | 0.8722 | 22.61 | 35 s | recall destroyed, barely faster |
+| B1 | sparse top-k, max_df 0.01, K 10/10/5 | 40,000 | 0.9816 | 0.9480 | 18.34 | 44 s | smaller K saves candidates, not time |
+
+**Two trends, both bad, both measured.** Cost exponent rose from 1.29 (2k→10k) to 1.60 (10k→40k), heading toward quadratic. Entity cover fell 0.995 → 0.984 → 0.970 as the haystack grew. Raising K to recover cover makes cost worse. Extrapolated to 2.21M entities this is 8–60 h for train blocking alone — EXPECTED, not measured, but the direction is measured.
+
+**Conclusion: top-K cosine over a whole country group does not scale.** Pruning bought 5.4x and stopped helping. Candidate generation needs to become O(n) — cheap exact blocking keys, unioned, with the three cosine views reranking inside each block (which keeps `cos_name` / `cos_full` / `cos_addr` and everything downstream unchanged). See issue #1.
 
 ---
 
