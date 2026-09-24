@@ -1,53 +1,50 @@
-# Approach Document (Official Submission — Required, Scored)
+# Approach Document: Business Entity Resolution
 
-**This is not optional documentation for ourselves. Per the official Unstop
-rules: "the top 10 teams will be invited to the Grand Finale" based on
-"the leaderboard results AND the solution presented in the document."
-A well-written 1-2 pages here can be the difference between Top 50 and
-Top 10. Update this throughout the 72 hours, not in the final hour.**
+> Draft kept in sync with the code. The final version is copied into the organisers' `Documentation_template.md` (same headings) and zipped. Every number must come from `work/report.json` or `STATUS.md`. **[TBD]** = fill in from a real run.
 
-Keep this to 1-2 pages when exported. Write for a reader who has NOT
-watched us build this — a scientist skimming 50 submissions.
+## 1. Methodology used
 
----
+A three-stage pipeline: **normalise → block (candidate generation) → pairwise match → set-level decision**.
+- The problem is framed as binary classification over (S1 entity, S2/S3 candidate) pairs, followed by a decision layer tuned directly for the official metric (macro F0.5 per S1 entity, singletons included).
+- Validation: 5 folds over S1 entities (all pairs of an entity in one fold), OOF predictions, and a cross-fitted threshold, so the reported CV is not tuned on the rows it scores.
+- **Leave-one-country-out** runs estimate how well the model transfers to the unseen test country (France).
+- No external data or lookup services are used. Every signal comes from the provided records.
 
-## Problem Understanding
-<!-- 2-3 sentences: what we understood the business problem to be, and the
-exact metric we optimized for. -->
+## 2. Candidate generation / blocking strategy
 
-## Our Validation Approach
-<!-- 2-4 sentences: what CV strategy we used and WHY it matches the test
-set's actual structure. This signals rigor to a reviewer who knows what
-"leaderboard shakeup" means — say explicitly that we prioritized local CV
-over public leaderboard score. -->
+- **Normalisation (country-agnostic):** accent stripping, lower-casing, punctuation removal, expansion of name abbreviations (Corp→corporation, Pvt→private, &→and) and address abbreviations (Rd→road, Blvd/Bd→boulevard, Nr→near). A "core name" drops legal forms (Inc, LLC, Pvt Ltd, SARL, SAS, …).
+- **Three blocking views,** each giving top-K nearest neighbours by TF-IDF cosine within the record's country (falling back to all records if the country is absent):
+  1. character 2–4-grams of the core name, K = 15
+  2. character 3–4-grams of core name + address, K = 15
+  3. word 1–2-grams of the address, K = 5
+  
+  The union of the three is the candidate set.
+- Recall ceiling on train: **[TBD]**. Average candidates per S1: **[TBD]**. Reduction ratio vs all pairs: **[TBD]**.
 
-## Feature Engineering — What We Built and Why
-<!-- Bullet the 3-5 highest-leverage features/transformations, with a one-
-line reason each ties to the actual business problem, not a generic list. -->
+## 3. Model architecture and feature engineering
 
-## Modeling Approach
-<!-- Which model(s), why chosen over alternatives, and whether/how we
-ensembled. If we stacked models, briefly say how (OOF, what blender). -->
+- **28 pair features** (`src/pair_features.py`):
+  - string similarity (rapidfuzz ratio / token-sort / token-set / partial / Jaro-Winkler) on the full and core name and on the address
+  - the three blocking cosines
+  - postal code and street-number agreement (missing is kept distinct from "different")
+  - whether the candidate comes from Source 3
+  - **context features:** the candidate's rank and score gap within its S1 entity's list, and how many S1 entities compete for the same candidate
+- **Matcher:** LightGBM binary classifier (lr 0.05, 63 leaves, early stopping); test predictions = average of the 5 fold models.
+- **Decision layer** (`src/decide.py`):
+  - **one-to-one assignment**, where each S2/S3 record goes only to its highest-probability S1 entity (enabled because only **[TBD]**% of training records match more than one S1 entity)
+  - probability threshold chosen on OOF predictions for macro F0.5 (t = **[TBD]**)
 
-## Error Analysis — What We Found and Fixed
-<!-- 2-3 sentences: what systemic failure pattern we found when inspecting
-worst predictions, and what we did about it. This is the section that
-separates teams who iterated intelligently from teams who just tuned
-blindly — don't skip it even if time is short. -->
+## 4. Experiments and results
 
-## Results
-<!-- Local CV score (state the metric), and how confident we are it will
-hold on the private leaderboard, briefly. -->
+| Version | Change | CV macro-F0.5 (cross-fitted) | LOCO (US / India) | Public LB |
+|---|---|---|---|---|
+| E0 | All-empty baseline | [TBD] | — | [TBD] |
+| E1 | Baseline pipeline | [TBD] | [TBD] | [TBD] |
 
-## What We'd Do With More Time
-<!-- 2-3 bullets: honest, specific next steps — shows engineering maturity,
-not padding. -->
+## 5. Error analysis and other relevant information
 
----
+[TBD after the first error-analysis pass. The largest slices of false matches and misses, and what was changed.]
 
-**Reminders while filling this in:**
-- No invented numbers — every score/claim here must come from something we
-  actually ran and can reproduce.
-- Keep it readable by someone outside our team — avoid inside-team shorthand.
-- Update this as we go. The version at submission time is what gets scored;
-  don't leave it as a rushed draft written in the last hour.
+## 6. Conclusion and limitations
+
+[TBD]

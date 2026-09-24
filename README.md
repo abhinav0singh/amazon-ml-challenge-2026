@@ -25,8 +25,9 @@ repo/
 ├── README.md                    ← you are here
 ├── requirements.txt              pinned deps — install with pip install -r requirements.txt
 ├── src/
-│   ├── cv_folds.py               THE locked CV fold generator — run once, everyone imports the output
-│   └── features.py               fold-safe feature engineering functions
+│   ├── cv_folds.py               locked S1-entity folds -> work/folds.csv
+│   ├── pair_features.py / decide.py / run_pipeline.py / make_empty_submission.py
+│   ├── metric.py / data_io.py / normalize.py / blocking.py
 ├── docs/
 │   ├── problem_formulation.md    filled by Team Leader, hour 0 — locked after that
 │   └── approach_document.md      REQUIRED official submission — see below, not internal notes
@@ -99,15 +100,30 @@ self-merge + a chat ping beats waiting on formal review — we don't have
 review-cycle time to spare). Never let a long-lived branch sit unmerged for 
 more than a few hours.
 
-## Timeline (verified against official rules, not the loose blog dates)
+## Timeline (from the official guidelines PDF, 25 Sep 2026)
 
 | When | What |
 |---|---|
-| **Sep 25, ~12:00 AM IST** | Hackathon starts (24 Sep 2:30 PM EDT) |
-| Throughout 72 hrs | Build, and keep `docs/approach_document.md` updated as we go |
-| **Sep 27, ~12:29 AM IST** | Submission closes (27 Sep 2:29 PM EDT) — code/notebook **and** the approach doc, zipped |
-| Oct 2 | Top 50 announced |
-| Oct 7 | Grand Finale — Top 10 present live to Amazon Scientists |
+| **25 Sep 12:00 AM IST** | Challenge window opens; problem and data released |
+| Each day | **Max 5 leaderboard uploads/day** (15 total). Only the Team Leader uploads, from one device |
+| **27 Sep 11:59 PM IST** | Challenge closes. Plan the final uploads by **22:00 IST** and the zip by **23:00 IST** |
+| After close | Top **100** announced (private + public LB + artefacts), then documents requested |
+
+> The earlier version of this table (close "Sep 27 ~12:29 AM IST", "Top 50/Top 10") came from an old blog post and contradicts the official PDF. Confirm via the organisers' Google Form; until then we keep a submittable best version ready at all times.
+
+## Run the pipeline (Business Entity Resolution)
+
+```bash
+pip install -r requirements.txt
+# put the organisers' student_resource/ folder at data/ -> data/dataset/{train,test}, data/utils/
+python src/metric.py                                   # metric self-test (0.714)
+python src/make_empty_submission.py --data data/dataset --out output_empty   # upload D1-1
+python src/run_pipeline.py --data data/dataset --out output --work work --loco
+python data/utils/validate_submission.py --matching output/matching_results.tsv \
+       --candidate output/candidate_pairs.tsv --test-dir data/dataset/test
+```
+Outputs: `output/matching_results.tsv` (upload this), `output/candidate_pairs.tsv`, and `work/report.json` (blocking recall, CV, LOCO; copy these numbers into `STATUS.md`).
+Versioning: copy each uploaded `output/` into `submissions/<tag>/` and `git tag <tag>`. The old `submissions/*.csv` placeholders are empty and the wrong format (the portal needs `.tsv`), so delete them.
 
 ## Setup checklist (do this before the clock starts)
 

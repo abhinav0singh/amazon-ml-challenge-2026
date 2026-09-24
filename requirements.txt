@@ -19,7 +19,11 @@ catboost==1.2.5
 optuna==3.6.1          # only for LATE-stage tuning, not early — see ml_engineer_prompt.md
 imbalanced-learn==0.12.3   # if target is imbalanced (StratifiedKFold territory)
 
-# NLP / vision — uncomment only if the problem statement needs it
+# Entity resolution (problem = Business Entity Resolution)
+rapidfuzz==3.9.6         # MIT — string similarity features
+pyarrow==16.1.0           # parquet for OOF / pair caches
+
+# NLP — optional embeddings for blocking/France (MIT/Apache model ≤ 8B only)
 # sentence-transformers==3.0.1
 # torch==2.3.1
 
@@ -29,6 +33,5 @@ seaborn==0.13.2
 jupyter==1.0.0
 ipykernel==6.29.4
 
-# AWS (per the prep session — SageMaker SDK v3)
-sagemaker==2.224.1
-boto3==1.34.131
+# AWS SDKs removed from the core env: not needed to reproduce the pipeline,
+# and the rules forbid external lookup services. Install separately if using SageMaker compute.
