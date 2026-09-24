@@ -18,44 +18,93 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 
 K_NAME, K_FULL, K_ADDR = 15, 15, 5
 
+# Rows of S1 per sparse matmul chunk. The cost driver is the number of non-zero
+# similarities produced, not the chunk's row count, so this trades peak memory
+# against Python-loop overhead.
+CHUNK_ROWS = 2048
 
-def _topk_sparse(A, B, k, max_cells=4e7):
-    """For each row of A, return the indices and cosines of its top-k rows in B.
-    A and B are L2-normalised sparse TF-IDF matrices. Computed in row chunks
-    so peak memory stays about max_cells*4 bytes."""
-    n_b = B.shape[0]
-    k = min(k, n_b)
-    step = max(1, int(max_cells // max(n_b, 1)))
-    idx_out = np.zeros((A.shape[0], k), dtype=np.int64)
-    sim_out = np.zeros((A.shape[0], k), dtype=np.float32)
+# Vocabulary pruning. An n-gram present in a large share of records carries
+# almost no IDF weight but sits in a huge posting list, so it dominates the
+# product's non-zeros while barely moving the cosine. Dropping those terms is
+# the difference between a feasible and an infeasible matmul at 4.7M records.
+# max_df is a fraction of documents; min_df drops one-off noise.
+#
+# MEASURED on a 40,000-entity train sample (src/sweep_blocking.py, 25 Sep):
+#   max_df  recall  cover   cands/S1  secs
+#   1.0     0.9894  0.9683  27.07     241.0
+#   0.1     0.9897  0.9697  27.12     133.1
+#   0.01    0.9842  0.9551  27.27      44.8
+#   0.001   0.9495  0.8722  22.61      35.0
+# 0.1 is free (recall equal to unpruned, 1.8x faster). 0.01 costs 0.005 recall
+# for 5.4x. 0.001 destroys recall for almost no further gain, which shows the
+# remaining cost is NOT in long posting lists -- so pruning alone cannot make
+# this design scale. 0.01 is provisional, chosen to keep experiments fast while
+# the candidate-generation design is settled; revisit once it is.
+MAX_DF, MIN_DF = 0.01, 2
+
+
+def _topk_sparse(A, B, k, chunk_rows=CHUNK_ROWS):
+    """For each row of A, the indices of its top-k most similar rows in B.
+
+    A and B are L2-normalised sparse TF-IDF matrices, so the product is the
+    cosine. The product is kept SPARSE end to end: only pairs sharing at least
+    one n-gram are ever materialised, which at this data scale is a tiny
+    fraction of A.shape[0] * B.shape[0].
+
+    Returns flat (rows, cols) index arrays rather than a fixed (n_a, k) block,
+    because a row with fewer than k non-zero similarities genuinely has fewer
+    than k candidates. The old dense version padded those rows out to k with
+    arbitrary zero-similarity records; dropping them is both cheaper and
+    cleaner, and it is the one behavioural difference from that version.
+    """
     Bt = B.T.tocsr()
-    for start in range(0, A.shape[0], step):
-        S = (A[start:start + step] @ Bt).toarray().astype(np.float32)
-        part = np.argpartition(-S, k - 1, axis=1)[:, :k]
-        rows = np.arange(S.shape[0])[:, None]
-        idx_out[start:start + step] = part
-        sim_out[start:start + step] = S[rows, part]
-    return idx_out, sim_out
+    rows_out, cols_out = [], []
+    for start in range(0, A.shape[0], chunk_rows):
+        S = (A[start:start + chunk_rows] @ Bt).tocsr()
+        indptr, indices, data = S.indptr, S.indices, S.data
+        for i in range(S.shape[0]):
+            lo, hi = indptr[i], indptr[i + 1]
+            n = hi - lo
+            if n == 0:
+                continue
+            if n > k:
+                sel = lo + np.argpartition(-data[lo:hi], k - 1)[:k]
+            else:
+                sel = np.arange(lo, hi)
+            cols_out.append(indices[sel])
+            rows_out.append(np.full(sel.size, start + i, dtype=np.int64))
+    if not rows_out:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+    return np.concatenate(rows_out), np.concatenate(cols_out)
 
 
 def _block_group(s1g, s23g):
     """Candidates for one country group. Returns a long DataFrame of
     (s1_id, cand_id, cos_name, cos_full, cos_addr)."""
     specs = [
-        ("cos_name", "name_core", dict(analyzer="char_wb", ngram_range=(2, 4), min_df=1), K_NAME),
-        ("cos_full", "full_n", dict(analyzer="char_wb", ngram_range=(3, 4), min_df=1), K_FULL),
-        ("cos_addr", "addr_n", dict(analyzer="word", ngram_range=(1, 2), min_df=1), K_ADDR),
+        ("cos_name", "name_core", dict(analyzer="char_wb", ngram_range=(2, 4)), K_NAME),
+        ("cos_full", "full_n", dict(analyzer="char_wb", ngram_range=(3, 4)), K_FULL),
+        ("cos_addr", "addr_n", dict(analyzer="word", ngram_range=(1, 2)), K_ADDR),
     ]
     pieces, mats = [], {}
     for name, col, vec_kw, k in specs:
-        vec = TfidfVectorizer(sublinear_tf=True, dtype=np.float32, **vec_kw)
-        vec.fit(pd.concat([s1g[col], s23g[col]]))
+        text = pd.concat([s1g[col], s23g[col]])
+        vec = TfidfVectorizer(sublinear_tf=True, dtype=np.float32,
+                              max_df=MAX_DF, min_df=MIN_DF, **vec_kw)
+        try:
+            vec.fit(text)
+        except ValueError:
+            # Pruning can empty the vocabulary on a small group (every term is
+            # either too rare or, in a handful of records, too common). Fall
+            # back to no pruning: small groups are cheap to match exhaustively.
+            vec = TfidfVectorizer(sublinear_tf=True, dtype=np.float32, min_df=1, **vec_kw)
+            vec.fit(text)
         A, B = vec.transform(s1g[col]), vec.transform(s23g[col])
         mats[name] = (A, B)
-        idx, _ = _topk_sparse(A, B, k)
+        rows, cols = _topk_sparse(A, B, k)
         pieces.append(pd.DataFrame({
-            "s1_id": np.repeat(s1g["entity_id"].to_numpy(), idx.shape[1]),
-            "cand_id": s23g["entity_id"].to_numpy()[idx.ravel()],
+            "s1_id": s1g["entity_id"].to_numpy()[rows],
+            "cand_id": s23g["entity_id"].to_numpy()[cols],
         }))
     cand = pd.concat(pieces, ignore_index=True).drop_duplicates().reset_index(drop=True)
 
