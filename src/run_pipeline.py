@@ -2,6 +2,7 @@
 run_pipeline.py: end-to-end baseline, data -> blocking -> matching -> output.
 
     python src/run_pipeline.py --data data/dataset --out output [--loco] [--no-one-to-one]
+    python src/run_pipeline.py --data data/dataset --out output_smoke --sample 20000
 
 Steps
   1. Normalise train and test records (normalize.py).
@@ -63,6 +64,46 @@ def label_pairs(pairs: pd.DataFrame, truth: dict) -> np.ndarray:
                        dtype=np.int8, count=len(pairs))
 
 
+def subsample(s1, s23, n, seed, truth=None):
+    """SMOKE TEST ONLY. Cut the split down to `n` Source-1 entities.
+
+    Keeps the S2/S3-records-per-S1-entity density of the full split, so the
+    pipeline sees realistically sized candidate pools per entity:
+      * train (truth given): keep every true match of the kept entities, then
+        top up with random other S2/S3 records to reach the original density.
+        The top-up records are real distractors -- most belong to S1 entities
+        we dropped -- so they are exactly the kind of near-miss the matcher
+        must reject.
+      * test (no truth): keep a random S1 sample and thin S2/S3 by the same rate.
+
+    The resulting scores are NOT comparable to a full run and must never be
+    quoted as CV. The haystack is smaller, so blocking recall and precision are
+    both optimistic. This exists to prove the pipeline runs end to end.
+    """
+    rng = np.random.default_rng(seed)
+    ids = s1["entity_id"].to_numpy()
+    if n >= len(ids):
+        return s1, s23
+    density = len(s23) / len(s1)  # S2/S3 records per S1 entity in the FULL split
+    keep = rng.choice(ids, size=n, replace=False)
+    s1s = s1[s1["entity_id"].isin(set(keep))]
+
+    if truth is None:
+        pool = s23["entity_id"].to_numpy()
+        take = min(len(pool), int(round(n * density)))
+        wanted = set(rng.choice(pool, size=take, replace=False))
+    else:
+        wanted = set()
+        for s in keep:
+            wanted |= truth.get(s, set())
+        short = int(round(n * density)) - len(wanted)
+        if short > 0:
+            others = s23.loc[~s23["entity_id"].isin(wanted), "entity_id"].to_numpy()
+            take = min(len(others), short)
+            wanted |= set(rng.choice(others, size=take, replace=False))
+    return s1s, s23[s23["entity_id"].isin(wanted)]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default="data/dataset", help="folder containing train/ and test/")
@@ -71,14 +112,32 @@ def main():
     ap.add_argument("--loco", action="store_true", help="leave-one-country-out check")
     ap.add_argument("--no-one-to-one", action="store_true")
     ap.add_argument("--no-country-block", action="store_true")
+    ap.add_argument("--sample", type=int, default=0, metavar="N",
+                    help="SMOKE TEST: run on N Source-1 entities instead of the full split. "
+                         "Scores from a sampled run are NOT CV and must not be reported as such.")
+    ap.add_argument("--sample-seed", type=int, default=SEED)
     args = ap.parse_args()
     os.makedirs(args.work, exist_ok=True)
     report = {}
+
+    # A sampled run must never touch the locked artefacts of a real run: it writes
+    # its own folds file and its own report, so work/folds.csv stays authoritative.
+    smoke = args.sample > 0
+    folds_path = os.path.join(args.work, f"folds_sample{args.sample}.csv" if smoke else "folds.csv")
+    report_path = os.path.join(args.work, f"report_sample{args.sample}.json" if smoke else "report.json")
+    if smoke:
+        log(f"*** SMOKE TEST: {args.sample} S1 entities, seed {args.sample_seed}. "
+            f"Numbers are NOT comparable to a full run -- do not quote them as CV. ***")
+        report["sample"] = {"n_s1": args.sample, "seed": args.sample_seed,
+                            "warning": "subsampled smoke test; scores are optimistic and not CV"}
 
     # ---------- train ----------
     log("loading + normalising train")
     s1, s23 = load_split(args.data, "train")
     truth = load_truth(args.data)
+    if smoke:
+        s1, s23 = subsample(s1, s23, args.sample, args.sample_seed, truth)
+        log(f"sampled train: {len(s1)} S1, {len(s23)} S2/S3")
     s1, s23 = add_normalized_columns(s1), add_normalized_columns(s23)
     s1_ids = s1["entity_id"].tolist()
     truth = {s: truth.get(s, set()) for s in s1_ids}
@@ -101,7 +160,7 @@ def main():
     pairs["y"] = label_pairs(pairs, truth)
 
     # ---------- CV ----------
-    s1_fold = make_s1_folds(s1_ids, path=os.path.join(args.work, "folds.csv"), seed=SEED)
+    s1_fold = make_s1_folds(s1_ids, path=folds_path, seed=SEED)
     pairs["fold"] = pairs["s1_id"].map(s1_fold)
     pairs["p"] = np.nan
     models = []
@@ -141,6 +200,17 @@ def main():
     # ---------- test ----------
     log("test: normalise + block + features")
     t1, t23 = load_split(args.data, "test")
+    if smoke:
+        # No truth for test, so the kept S2/S3 records are a blind random sample:
+        # most true matches of the kept test entities are simply not in the file.
+        # The test half of a smoke run therefore proves only that the code path
+        # runs and writes well-formed output. Its prediction rate is meaningless.
+        t1, t23 = subsample(t1, t23, args.sample, args.sample_seed)
+        log(f"sampled test: {len(t1)} S1, {len(t23)} S2/S3 "
+            f"(random sample -- test prediction rates below are NOT interpretable)")
+        report["sample"]["test_caveat"] = (
+            "test S2/S3 sampled without truth, so most real matches are absent; "
+            "pred_nonempty_share is not comparable to oof_pred_nonempty_share")
     t1, t23 = add_normalized_columns(t1), add_normalized_columns(t23)
     tcand = generate_candidates(t1, t23, by_country=by_country)
     tpairs = build_pair_features(tcand, t1, t23)
@@ -159,15 +229,21 @@ def main():
         "countries": t1["country"].value_counts().to_dict(),
     }
     log(f"test: {report['test']}")
-    with open(os.path.join(args.work, "report.json"), "w") as f:
+    with open(report_path, "w") as f:
         json.dump(report, f, indent=2, default=str)
+    log(f"report written to {report_path}")
 
-    validator = os.path.join(os.path.dirname(args.data.rstrip("/")), "utils", "validate_submission.py")
+    if smoke:
+        log("smoke test: skipping the official validator (a sampled output covers only "
+            "some test S1 entities, so it would fail the 'every entity present' rule by design)")
+        return
+
+    validator = os.path.join(os.path.dirname(args.data.rstrip("/\\")), "utils", "validate_submission.py")
     if os.path.exists(validator):
         log("running official validator")
         subprocess.run([sys.executable, validator, "--matching", os.path.join(args.out, "matching_results.tsv"),
                         "--candidate", os.path.join(args.out, "candidate_pairs.tsv"),
-                        "--test-dir", os.path.join(args.data, "test")])
+                        "--test-dir", os.path.join(args.data, "test"), "--check-ids"])
     else:
         log(f"validator not found at {validator}; run utils/validate_submission.py manually")
 
