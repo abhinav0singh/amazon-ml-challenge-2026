@@ -13,6 +13,21 @@ Paste this whole file into your AI session as context before your first prompt o
 
 Three sources of business records (`S1-`, `S2-`, `S3-` prefixed `entity_id`s), no shared keys, noisy names and addresses. **Source 1 is deduplicated.** For every Source 1 entity in the test set, output the list of Source 2 / Source 3 test records that refer to the same real business — which may be **zero, one, or many**. Train covers **US and India**; test also contains **France, which appears nowhere in training**.
 
+### The data, measured — do not re-derive these, and do not contradict them from memory
+
+Counted directly from the TSVs on 25 Sep 2026. Anything here that a run later contradicts is a bug worth investigating, not a number to quietly overwrite.
+
+| | Train | Test |
+|---|---|---|
+| S1 entities | 2,206,822 | **1,732,544** |
+| S2 + S3 records | 10,320,219 | 9,969,589 |
+| Countries (S1) | US 1,323,633 · India 883,188 | US 663,106 · India 809,986 · **France 259,452 (15.0 %)** |
+
+- **Singletons: 123,247 = 5.58 % of train S1.** Predicting empty everywhere scores **≈ 0.056**.
+- **Mean 3.67 true matches** per non-singleton entity; 7,638,365 true pairs in total.
+- **Zero** S2/S3 records belong to more than one S1 entity — exactly zero, across all 7.6 M pairs. One-to-one is a hard, free constraint, not an approximation.
+- Test S2/S3 carry country labels including France, so country-grouped blocking works on every split.
+
 ## 2. The metric — everything follows from this
 
 **F0.5, computed per Source 1 entity, then macro-averaged over ALL Source 1 entities.**
@@ -23,8 +38,8 @@ F0.5 = (1.25 × Precision × Recall) / (0.25 × Precision + Recall)
 
 Three consequences that must shape every decision you make:
 
-1. **Precision is weighted 2× recall.** A false merge costs more than a miss. When the model is unsure, predicting nothing is the better bet.
-2. **Singletons are scored.** An entity with no true matches scores **1.0** if you predict an empty list and **0.0** if you predict anything at all. A large share of the total score is just "correctly say nothing."
+1. **Precision is weighted 2× recall.** A false merge costs more than a miss. For an entity with 4 true matches: 3 correct and 0 wrong scores **0.938**; all 4 plus 1 wrong scores **0.833**. When the model is unsure about *one candidate among several*, dropping it is the better bet.
+2. **Singletons are scored, but there are few of them.** An entity with no true matches scores **1.0** if you predict an empty list and **0.0** if you predict anything at all. **Singletons are only 5.58 % of entities** (measured — see §1), so predicting empty everywhere scores ≈ 0.056. **94.4 % of the available score requires actually finding matches**, and predicting nothing on a non-singleton scores **0.0**. The correct posture is high precision that still commits — not maximum caution. Do not tune toward silence.
 3. **It is a macro-average over entities, not over pairs.** An entity with one candidate counts exactly as much as an entity with forty. Never optimise pair-level accuracy, AUC, or logloss as the final objective — they are proxies only.
 
 The metric lives in `src/metric.py` and is unit-tested against the official worked example (0.714). **Do not write a second copy of it anywhere.** `python src/metric.py` must print `metric OK` before you trust any number you report.
@@ -50,7 +65,8 @@ Hand-written abbreviation dictionaries (Rd→road, Pvt→private, SARL as a lega
 - **Score over ALL Source 1 entities in the fold — not just the ones that have candidates.** An entity that blocking found nothing for is a real prediction of "empty", and it still scores. Filtering it out inflates your number. Always pass the full `s1_ids` list to `macro_f05`.
 - **The honest number is the cross-fitted one.** `tune()` picks a threshold on the same rows it scores, so its output is optimistic — it is for curve inspection only. **`cross_fitted_score()` is what goes in `STATUS.md` and the approach doc.** Never report a threshold-optimised score as CV.
 - **Accept a change only if** it gains more than 2× the seed-to-seed noise **and** improves at least 4 of the 5 folds. Anything smaller is noise; log it as `inconclusive` and move on.
-- **Unseen-country check:** `--loco` trains without one country and scores on it. It is our only proxy for France. A change that improves CV but drops LOCO is a change that will hurt us on a third of the test set.
+- **Unseen-country check:** `--loco` trains without one country and scores on it. It is our only proxy for France. A change that improves CV but drops LOCO is a change that will hurt us on **15.0 % of the test set** (259,452 of 1,732,544 test S1 entities are French).
+- **Smoke-test runs are not CV.** `--sample N` runs the pipeline on N entities so it can be proven end to end. It writes `folds_sampleN.csv` and `report_sampleN.json` and never touches the locked artefacts. Its scores are inflated by the small haystack — the `--sample 2000` run scored 0.99 — and must never be quoted as CV or logged in `STATUS.md` §5 as a result. On the test side of a sampled run, S2/S3 is a blind random sample (no truth to select on), so the prediction rate there is meaningless by construction.
 
 **Known caveat, stated honestly:** the one-to-one assignment in `decide.py` deduplicates candidates within whatever frame it is given, so in CV it resolves competition within a fold (≈1/5 of entities) while at test time it resolves across all entities. The direction of the bias is small but real. Do not "fix" it by scoring test-like competition into folds without discussing it — just know the CV number carries this approximation.
 
@@ -79,6 +95,7 @@ Hand-written abbreviation dictionaries (Rd→road, Pvt→private, SARL as a lega
 2. Before you push: `python src/metric.py` passes, and your change runs end to end at least once.
 3. After any experiment, add **one row** to `STATUS.md` §5 (experiment log) and **one line** to §8 (doc notes). The §8 headings match the organisers' `Documentation_template.md`, so the write-up assembles itself.
 4. Never commit anything under `data/` — it is gitignored and it is 1 GB.
+   **Never run `git add .`** — name the paths you mean (`git add src docs STATUS.md`). A blanket add has already pulled a whole `.venv` into a commit once; with `work/` holding parquet caches it gets worse. `.gitignore` covers `.venv/`, `work/`, `output*/` and `*.parquet`, with `work/folds.csv` as the one deliberate `git add -f` exception (§4).
 5. Every leaderboard upload gets a git tag (`sub-D1-1`, `sub-D1-2`, …) and a copy of `output/` in `submissions/<tag>/`. **Version history is required for shortlisting.**
 
 ## 8. Submission discipline
@@ -95,15 +112,25 @@ We get 15 uploads. They are for questions CV cannot answer.
 
 ## 9. Commands
 
+**Always use `.venv\Scripts\python`, never bare `python`.** The `python` first on PATH may be 3.14, which cannot install our pinned versions. Build the environment with **Python 3.12**:
+
 ```powershell
-python src\metric.py                                   # must print: metric OK
-python src\make_empty_submission.py --data <DATA> --out output_empty
-python src\run_pipeline.py --data <DATA> --out output --work work --loco
-python <DATA>\..\utils\validate_submission.py --matching output\matching_results.tsv `
-       --candidate output\candidate_pairs.tsv --test-dir <DATA>\test
+py -3.12 -m venv .venv
+.venv\Scripts\python -m pip install -r requirements.txt
 ```
 
-`<DATA>` is the folder holding `train/` and `test/` — keep it **outside OneDrive** (e.g. `C:\amlc\dataset`). Results land in `work/report.json`: blocking recall, CV, LOCO, prediction rates. Those numbers go into `STATUS.md`; do not retype them from memory.
+```powershell
+.venv\Scripts\python src\metric.py                     # must print: metric OK
+.venv\Scripts\python src\make_empty_submission.py --data <DATA> --out output_empty
+.venv\Scripts\python src\run_pipeline.py --data <DATA> --out output_smoke --sample 2000   # smoke test, ~3 min
+.venv\Scripts\python src\run_pipeline.py --data <DATA> --out output --work work --loco    # the real thing
+.venv\Scripts\python <DATA>\..\utils\validate_submission.py --matching output\matching_results.tsv `
+       --candidate output\candidate_pairs.tsv --test-dir <DATA>\test --check-ids
+```
+
+`<DATA>` is the folder holding `train/` and `test/` — keep it **outside OneDrive**. On P1's machine that is `C:\amlc\student_resource\dataset`, with the organisers' `utils\` and `Documentation_template.md` beside it in `C:\amlc\student_resource\`. Results land in `work/report.json`: blocking recall, CV, LOCO, prediction rates. Those numbers go into `STATUS.md`; do not retype them from memory.
+
+`--check-ids` makes the validator confirm every ID exists in the test set. It costs a few GB of RAM and some time. Run it before every upload anyway — it is cheaper than a wasted submission.
 
 ## 10. For AI agents specifically
 
