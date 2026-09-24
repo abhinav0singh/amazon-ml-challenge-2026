@@ -194,6 +194,21 @@ Ranked by (expected gain × likelihood) / hours. **Step 0 is not optional: every
 | Hand-written normalisation dictionaries allowed? | ☐ unanswered | Our reasoned answer is **yes** (§1.2). Asking costs nothing and produces a citable answer for the methodology doc. |
 | Public/private split size? | ☐ unanswered | Low stakes. Affects only how much we read into public-LB movement. |
 
+### 4.2b Third-party claims about these rules — ASSUMED, not verified
+
+On 25 Sep a summary of "official Unstop rules and historical precedent" was brought to the team, answering several of the questions above. **None of it could be confirmed in the two official documents we hold.** It is recorded here as assumption, with the verification each one needs.
+
+| Claim | Status | How to verify |
+|---|---|---|
+| Private LB takes the **best** submission, quoting: "Every participant/team will be ranked on the maximum score of the submission and submission time" | **UNVERIFIED.** Searched both official documents for `maximum score`, `max score`, `best submission`, `ranked on`, `submission time`, `last submission` — **zero matches in either.** The wording may exist on the Unstop competition page, which we have not read. | P1 reads the rules tab of the Unstop competition page **in their existing session** and quotes the exact sentence. See the warning below. |
+| Public/private split size unpublished | Consistent with our own reading; neither document states it. | No action; assume the public set is small and noisy. |
+| Pretrained open-weight models permitted; 2024 finalists used 8B models | Plausible — Constraint 5 naming a licence and a parameter cap strongly implies pretrained models are expected. But the 2024 precedent is a different problem with different rules, so it is not evidence about this one. | Query form. |
+| The 8B cap applies to the **whole active pipeline**, not just the scoring model | The conservative reading, and therefore the one to adopt. Costs us nothing today: LightGBM plus TF-IDF uses zero pretrained parameters. | Query form. |
+
+> ⚠️ **Do not open the Unstop portal in a second browser or on a second device to check this.** The guidelines state that simultaneous logins are not allowed and that "the system may terminate the ML Challenge altogether". P1 checks it in the session they already have, on the one machine they upload from. No teammate and no tool should open it independently.
+
+**The ambiguity is neutralised by behaviour, not by an answer.** Make the best-CV submission the **last** upload before 22:00 IST on Day 3. That is correct if the last upload counts, correct if the best counts, and correct if one is selected. The only cost is giving up late-Day-3 experimentation, which §8 rules out anyway.
+
 **New questions to add:**
 
 | New question | Why |
