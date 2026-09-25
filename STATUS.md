@@ -97,7 +97,7 @@ Recall ceiling = share of true pairs that survive blocking. Target ≥ 0.98 with
 
 | Slot | Time (IST) | Git tag | Description | CV | Public LB | Validator PASS | Keep for final? |
 |---|---|---|---|---|---|---|---|
-| D1-1 | | | Empty-prediction baseline (format check; public LB ≈ public singleton share) | | | | |
+| D1-1 | 25 Sep 16:49 | `sub-D1-1` | Empty-prediction baseline (format check) | n/a | **0.056** | PASS (`--check-ids`) | no |
 | D1-2 | | | Rule-based fuzzy baseline | | | | |
 | D1-3 | | | First LightGBM matcher + OOF threshold | | | | |
 | D1-4 | | | + one-to-one assignment / conflict resolution | | | | |
@@ -106,7 +106,9 @@ Recall ceiling = share of true pairs that survive blocking. Target ≥ 0.98 with
 | D3-1 … D3-3 | | | Best candidates | | | | |
 | D3-4, D3-5 | | | **Reserved:** final best-CV + hedge. Upload before 22:00 IST | | | | |
 
-Rules: never spend an upload on a threshold or hyperparameter nudge. A public-LB difference below noise is not evidence.
+Rules: never spend an upload on a threshold or hyperparameter nudge.
+
+**D1-1 result, 25 Sep:** predicted ≈ 0.056 from the train singleton share (123,247 / 2,206,821 = 5.585%); the portal returned **0.056**. Three things confirmed: the upload path and file format are accepted, the public subset matches train on singleton share, and our local metric maps onto the official scorer. Leaderboard context the same day: 1st 0.985884, 2nd 0.984644, 3rd 0.98435, 8th 0.982 — the whole top eight spans 0.0039, so the contest lives in the 0.98+ band and the decision layer is where it is won. A public-LB difference below noise is not evidence.
 
 ---
 

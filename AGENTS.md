@@ -19,11 +19,11 @@ Counted directly from the TSVs on 25 Sep 2026. Anything here that a run later co
 
 | | Train | Test |
 |---|---|---|
-| S1 entities | 2,206,822 | **1,732,544** |
+| S1 entities | 2,206,821 | **1,732,544** |
 | S2 + S3 records | 10,320,219 | 9,969,589 |
 | Countries (S1) | US 1,323,633 · India 883,188 | US 663,106 · India 809,986 · **France 259,452 (15.0 %)** |
 
-- **Singletons: 123,247 = 5.58 % of train S1.** Predicting empty everywhere scores **≈ 0.056**.
+- **Singletons: 123,247 = 5.58 % of train S1** (123,247 / 2,206,821). Predicting empty everywhere scores **≈ 0.056**.
 - **Mean 3.67 true matches** per non-singleton entity; 7,638,365 true pairs in total.
 - **Zero** S2/S3 records belong to more than one S1 entity — exactly zero, across all 7.6 M pairs. One-to-one is a hard, free constraint, not an approximation.
 - Test S2/S3 carry country labels including France, so country-grouped blocking works on every split.
