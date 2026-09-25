@@ -138,6 +138,19 @@ def normalise_compact(df, chunk=1_000_000):
             (np.asarray(nflat, dtype=np.int64), np.asarray(noff, dtype=np.int64)))
 
 
+def _normalize_version():
+    """Hash of normalize.py, used to invalidate the normalisation cache.
+
+    Without this a cache built by older normalisation code is reused silently,
+    and every number after it is computed from text the current code would not
+    produce. Nothing in the output would hint at it.
+    """
+    import hashlib
+    src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "normalize.py")
+    with open(src, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
 def load_or_normalise(df, work, tag):
     """Normalise, or reload a cached normalisation from a previous run.
 
@@ -147,15 +160,23 @@ def load_or_normalise(df, work, tag):
     """
     fp = os.path.join(work, f"norm_{tag}.parquet")
     fz = os.path.join(work, f"norm_{tag}.npz")
+    ver = _normalize_version()
     if os.path.exists(fp) and os.path.exists(fz):
-        log(f"  reusing cached normalisation for '{tag}'")
-        d = pd.read_parquet(fp)
         z = np.load(fz)
-        return d, (z["pf"], z["po"]), (z["nf"], z["no"])
+        cached = str(z["ver"]) if "ver" in z else "<none>"
+        if cached == ver:
+            log(f"  reusing cached normalisation for '{tag}'")
+            d = pd.read_parquet(fp)
+            return d, (z["pf"], z["po"]), (z["nf"], z["no"])
+        # A cache built by different normalisation code is silently wrong: every
+        # number downstream would be computed from text the current code would
+        # not produce, with nothing to show for it. Rebuild rather than reuse.
+        log(f"  normalize.py changed since cache for '{tag}' "
+            f"({cached[:8]} -> {ver[:8]}); re-normalising")
     d, p, nm = normalise_compact(df)
     try:
         d.to_parquet(fp, index=False)
-        np.savez(fz, pf=p[0], po=p[1], nf=nm[0], no=nm[1])
+        np.savez(fz, pf=p[0], po=p[1], nf=nm[0], no=nm[1], ver=ver)
         log(f"  cached normalisation for '{tag}'")
     except Exception as e:      # a cache failure must never kill the run
         log(f"  could not cache normalisation ({e}); continuing")
