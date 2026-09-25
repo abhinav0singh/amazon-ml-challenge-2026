@@ -41,7 +41,7 @@ import pandas as pd
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 from blocking import generate_candidates  # noqa: E402
 from cv_folds import make_s1_folds  # noqa: E402
-from data_io import load_split, load_truth  # noqa: E402
+from data_io import load_split, load_truth, read_tsv  # noqa: E402
 from decide import (apply_expected_f05, apply_relative_rule, apply_rule,  # noqa: E402
                     check_one_to_one, contested_share, cross_fitted_rule)
 from metric import macro_f05, precision_recall  # noqa: E402
@@ -59,11 +59,25 @@ def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+def _countries_for(data: str, s1_ids) -> dict:
+    """{s1_id: normalised country} for EVERY sampled entity, read from the source
+    file rather than from the pair frame. An entity blocking found no candidates
+    for has no row in the pair frame but is still a real prediction of "empty" and
+    must still be scored, so its country has to come from somewhere else."""
+    from normalize import basic_clean
+    s1 = read_tsv(os.path.join(data, "train", "train_source1.tsv"))
+    want = set(s1_ids)
+    s1 = s1[s1["entity_id"].isin(want)]
+    return {e: basic_clean(c) for e, c in zip(s1["entity_id"], s1["country"])}
+
+
 def build_frame(data: str, work: str, n: int, sample_seed: int):
     """Rebuild the sampled train pair frame exactly as run_pipeline.py does.
 
     Cached to <work>/pairs_features.parquet: blocking and the feature loop are the
     expensive part, and every model variant below reuses the same frame.
+    Returns (pairs, s1_ids, truth, country) where `country` covers every sampled
+    entity, not only the ones that got candidates.
     """
     cache = os.path.join(work, f"pairs_features_sample{n}.parquet")
     meta = os.path.join(work, f"sample_meta{n}.json")
@@ -71,7 +85,13 @@ def build_frame(data: str, work: str, n: int, sample_seed: int):
         log(f"reusing cached pair frame {cache}")
         with open(meta) as f:
             m = json.load(f)
-        return pd.read_parquet(cache), m["s1_ids"], {s: set(v) for s, v in m["truth"].items()}
+        if "country" not in m:      # cache written before countries were stored
+            log("cached meta has no country map; reading it from train_source1.tsv")
+            m["country"] = _countries_for(data, m["s1_ids"])
+            with open(meta, "w") as f:
+                json.dump(m, f)
+        return (pd.read_parquet(cache), m["s1_ids"],
+                {s: set(v) for s, v in m["truth"].items()}, m["country"])
 
     log("loading + normalising train")
     s1, s23 = load_split(data, "train")
@@ -89,11 +109,13 @@ def build_frame(data: str, work: str, n: int, sample_seed: int):
     pairs["y"] = label_pairs(pairs, truth)
     pairs["c"] = pairs["s1_id"].map(s1.set_index("entity_id")["country_n"])
 
+    country = dict(zip(s1["entity_id"], s1["country_n"]))
     os.makedirs(work, exist_ok=True)
     pairs.to_parquet(cache)
     with open(meta, "w") as f:
-        json.dump({"s1_ids": s1_ids, "truth": {s: sorted(v) for s, v in truth.items()}}, f)
-    return pairs, s1_ids, truth
+        json.dump({"s1_ids": s1_ids, "truth": {s: sorted(v) for s, v in truth.items()},
+                   "country": country}, f)
+    return pairs, s1_ids, truth, country
 
 
 def oof_predict(pairs: pd.DataFrame, s1_fold: dict, seed: int) -> np.ndarray:
@@ -167,7 +189,7 @@ def main():
     print("for comparing rules scored on identical pairs. Not CV.")
     print("=" * 78)
 
-    pairs, s1_ids, truth = build_frame(a.data, a.work, a.sample, a.sample_seed)
+    pairs, s1_ids, truth, country = build_frame(a.data, a.work, a.sample, a.sample_seed)
     s1_fold = make_s1_folds(s1_ids, path=os.path.join(a.work, f"folds_sample{a.sample}.csv"),
                             seed=SEED)
 
@@ -261,21 +283,29 @@ def main():
         pl = loco_predict(pairs)
         np.save(loco_path, pl)
     lframe = pairs[["s1_id", "cand_id", "c"]].assign(p=pl)
-    cmap = pairs.groupby("s1_id")["c"].first()
+    # Built from the FULL sampled entity list, so an entity blocking found no
+    # candidates for is still scored as the "empty" prediction it really is.
+    cmap = pd.Series(country)
     loco = {}
     for name, (rule, _) in RULES.items():
         params = results[ref_seed][name][2]
         chosen = max(set(map(str, params)), key=list(map(str, params)).count)
         pick = params[list(map(str, params)).index(chosen)]   # modal cross-fitted choice
         loco[name] = {"params_used": pick}
-        for country in sorted(pd.unique(pairs["c"])):
-            ids_c = cmap[cmap == country].index.tolist()
-            sub = lframe[lframe["c"] == country]
-            sc = macro_f05(rule(sub, pick), truth, ids_c)
-            P, R = precision_recall(rule(sub, pick), truth, ids_c)
-            loco[name][country] = {"macro_f05_sample": sc, "pair_P": P, "pair_R": R}
-            log(f"[LOCO sample] {name:34s} held out '{country}': {sc:.4f} "
-                f"(P={P:.3f} R={R:.3f}) at params={pick}")
+        for ctry in sorted(cmap.unique()):
+            ids_c = cmap[cmap == ctry].index.tolist()
+            sub = lframe[lframe["c"] == ctry]
+            pred = rule(sub, pick)
+            sc = macro_f05(pred, truth, ids_c)
+            P, R = precision_recall(pred, truth, ids_c)
+            have = set(sub["s1_id"].unique())
+            n_nocand = sum(1 for i in ids_c if i not in have)
+            loco[name][ctry] = {"macro_f05_sample": sc, "pair_P": P, "pair_R": R,
+                                "entities_scored": len(ids_c),
+                                "of_which_no_candidates": n_nocand}
+            log(f"[LOCO sample] {name:34s} held out '{ctry}': {sc:.4f} "
+                f"(P={P:.3f} R={R:.3f}) over {len(ids_c)} entities "
+                f"({n_nocand} with no candidates) at params={pick}")
 
     report.update(contested_share_by_t=contested, seed_noise_baseline=noise,
                   cross_fitted_sample={n: {"mean": results[ref_seed][n][0],
