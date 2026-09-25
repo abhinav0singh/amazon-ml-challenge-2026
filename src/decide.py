@@ -24,7 +24,6 @@ def check_one_to_one(truth: dict) -> float:
             seen[m] = seen.get(m, 0) + 1
     return sum(v > 1 for v in seen.values()) / max(len(seen), 1)
 
-
 def apply_rule(pairs: pd.DataFrame, t: float, one_to_one: bool) -> dict:
     """pairs: (s1_id, cand_id, p). Returns {s1_id: set(matched ids)}."""
     df = pairs[pairs["p"] >= t]
@@ -51,6 +50,8 @@ def cross_fitted_score(pairs, truth, s1_fold: dict, one_to_one: bool):
         va_ids = [s for s, k in s1_fold.items() if k == f]
         t, _, _ = tune(pairs[pairs["s1_id"].isin(tr_ids)], truth, tr_ids, one_to_one)
         pred = apply_rule(pairs[pairs["s1_id"].isin(va_ids)], t, one_to_one)
-        scores.append(macro_f05(pred, truth, va_ids))
+        score = macro_f05(pred, truth, va_ids)
+        scores.append(score)
+        print(f"  fold {f}: threshold={t:.3f}, F0.5={score:.4f}")
         ts.append(t)
     return float(np.mean(scores)), ts
