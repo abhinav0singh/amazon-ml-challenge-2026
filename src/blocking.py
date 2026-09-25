@@ -63,7 +63,7 @@ MAX_BLOCK = 20000
 # scale measured so far (so it costs nothing observed) while still bounding the
 # worst case at full scale. Tune with real numbers, not intuition -- see the B
 # blocking issue.
-MAX_CANDS = 80
+MAX_CANDS = 40
 
 
 def _topk_sparse(A, B, k, chunk_rows=CHUNK_ROWS):
