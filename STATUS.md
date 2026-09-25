@@ -151,3 +151,18 @@ Rules: never spend an upload on a threshold or hyperparameter nudge. A public-LB
 - [ ] Functions commented (required)
 - [ ] `Documentation_template.md` filled in from §8
 - [ ] Zip named `<team_name>_submission.zip` with the exact folder structure
+
+### B2 — multi-key blocking (rare-token inverted index), branch `p1-blocking-scale`
+
+| Sample | Recall ceiling | Entity cover | Cands / S1 | Blocking time |
+|---|---|---|---|---|
+| 2,000 | 0.9788 | 0.9435 | 19.2 | 9 s |
+| 10,000 | 0.9821 | 0.9530 | 39.9 | 42 s |
+| 40,000 | 0.9833 | 0.9546 | 60.6 | 148 s |
+| 40,000, MAX_CANDS=40 | 0.9686 | 0.9208 | 38.1 | 122 s |
+
+**Cost exponent 0.91 (sub-linear)** vs 1.60 and rising for B1, and entity cover is *stable* across scales where B1's fell. Extrapolated full-scale train blocking ~1.6 h vs ~7.7 h — EXPECTED, not measured; no full-scale run has completed.
+
+An early version using only exact keys (no rare tokens) scored recall 0.8785 / cover 0.7395 at 2k — exact whole-name keys are too brittle for this noise, which is why rare-token indexing is the core of the design.
+
+`MAX_CANDS` set to 80: at 40 it cost 0.034 entity cover for 37% fewer pairs, which is a bad trade now that blocking cost is linear.
