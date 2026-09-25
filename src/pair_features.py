@@ -66,13 +66,39 @@ _SCORERS = [
 ]
 
 
-def prepare_side(df: pd.DataFrame) -> dict:
+def ragged(sets) -> tuple:
+    """Pack an iterable of small int sets into (flat values, offsets).
+
+    A Python `set` costs about 216 bytes empty, so one per record for postal
+    codes and one for address numbers is ~5.4 GB across the 12.5M training
+    records -- measured, and enough on its own to exhaust a 16 GB laptop before
+    blocking even starts. The same information as a flat int64 array plus
+    offsets costs about 0.35 GB.
+    """
+    flat, off = [], [0]
+    for s in sets:
+        flat.extend(sorted(s))
+        off.append(len(flat))
+    return (np.asarray(flat, dtype=np.int64),
+            np.asarray(off, dtype=np.int64))
+
+
+def prepare_side(df: pd.DataFrame, postal=None, nums=None) -> dict:
     """Pack one side's normalised columns into position-indexed numpy arrays.
 
     Done once per split. Everything downstream indexes these by integer
     position, so no pair-length string structure is ever built.
+
+    `postal` and `nums` are (flat, offsets) pairs from `ragged`. They may be
+    left out, in which case the set-valued columns are read from `df` and
+    packed here -- convenient for sampled runs, but it materialises every set
+    at once, so full-scale callers should pass pre-packed arrays.
     """
     core = df["name_core"].to_numpy()
+    if postal is None:
+        postal = ragged(df["postal"])
+    if nums is None:
+        nums = ragged(df["nums"])
     return {
         "name_n": df["name_n"].to_numpy(),
         "name_core": core,
@@ -80,8 +106,8 @@ def prepare_side(df: pd.DataFrame) -> dict:
         # first token and length are cheap scalars, precomputed per record
         "first_tok": np.array([c.split(" ", 1)[0] if c else "" for c in core], dtype=object),
         "core_len": np.array([len(c) for c in core], dtype=np.float32),
-        "postal": df["postal"].to_numpy(),
-        "nums": df["nums"].to_numpy(),
+        "postal_flat": postal[0], "postal_off": postal[1],
+        "nums_flat": nums[0], "nums_off": nums[1],
         "is_s3": df["entity_id"].str.startswith("S3").to_numpy().astype(np.float32),
     }
 
@@ -139,20 +165,28 @@ def string_features(ia: np.ndarray, ib: np.ndarray, a: dict, b: dict,
     out[:, col["core_first_tok_eq"]] = (a["first_tok"][ia] == b["first_tok"][ib]).astype(np.float32)
     out[:, col["core_len_diff"]] = np.abs(a["core_len"][ia] - b["core_len"][ib])
 
-    # Set-valued features. Still a Python loop, but over 3 cheap set operations
-    # per pair rather than 16 string comparisons, and the sets are tiny.
-    ap, bp = a["postal"], b["postal"]
-    au, bu = a["nums"], b["nums"]
+    # Set-valued features, read out of the ragged arrays. Still a Python loop,
+    # but over 3 cheap operations per pair rather than 16 string comparisons,
+    # and each record's slice holds only a handful of integers.
+    apf, apo, bpf, bpo = a["postal_flat"], a["postal_off"], b["postal_flat"], b["postal_off"]
+    auf, auo, buf, buo = a["nums_flat"], a["nums_off"], b["nums_flat"], b["nums_off"]
     pm = out[:, col["postal_match"]]
     nj = out[:, col["num_jacc"]]
     no = out[:, col["num_overlap"]]
     for i in range(n):
-        x, y = ap[ia[i]], bp[ib[i]]
-        pm[i] = -1.0 if not (x and y) else float(not x.isdisjoint(y))
-        x, y = au[ia[i]], bu[ib[i]]
-        if x or y:
-            inter = len(x & y)
-            nj[i] = inter / len(x | y)
+        p, q = ia[i], ib[i]
+        x = apf[apo[p]:apo[p + 1]]
+        y = bpf[bpo[q]:bpo[q + 1]]
+        if x.size == 0 or y.size == 0:
+            pm[i] = -1.0                      # one side has no code: unknown, not different
+        else:
+            pm[i] = float(not set(x.tolist()).isdisjoint(y.tolist()))
+        x = auf[auo[p]:auo[p + 1]]
+        y = buf[buo[q]:buo[q + 1]]
+        if x.size or y.size:
+            sx, sy = set(x.tolist()), set(y.tolist())
+            inter = len(sx & sy)
+            nj[i] = inter / len(sx | sy)
             no[i] = inter
         else:
             nj[i] = -1.0

@@ -102,6 +102,42 @@ def _profile(stage):
         pass
 
 
+def normalise_compact(df, chunk=1_000_000):
+    """Normalise in row chunks, packing the set-valued columns away as we go.
+
+    `add_normalized_columns` gives each record a Python `set` for postal codes
+    and one for address numbers. At 216 bytes per empty set that is ~5.4 GB
+    across the 12.5M training records -- measured, and on its own enough to
+    exhaust a 16 GB laptop before blocking starts. Here each chunk's sets are
+    converted to ragged int arrays and dropped immediately, so at most `chunk`
+    of them exist at once.
+
+    Returns (frame without the set columns, postal ragged, nums ragged).
+    """
+    from pair_features import ragged
+    parts, pflat, poff, nflat, noff = [], [], [0], [], [0]
+    for i in range(0, len(df), chunk):
+        d = add_normalized_columns(df.iloc[i:i + chunk])
+        for s in d["postal"]:
+            pflat.extend(sorted(int(v) for v in s))
+            poff.append(len(pflat))
+        for s in d["nums"]:
+            nflat.extend(sorted(int(v) for v in s))
+            noff.append(len(nflat))
+        # blocking needs one representative postal code as a key; keep it as an
+        # int32 (0 = none) rather than the set, which is what costs the memory
+        d["postal1"] = d["postal"].map(lambda s: min((int(v) for v in s), default=0)).astype(np.int32)
+        parts.append(d.drop(columns=["postal", "nums"]))
+        del d
+        gc.collect()
+    out = pd.concat(parts, ignore_index=True) if len(parts) > 1 else parts[0]
+    del parts
+    gc.collect()
+    return (out,
+            (np.asarray(pflat, dtype=np.int64), np.asarray(poff, dtype=np.int64)),
+            (np.asarray(nflat, dtype=np.int64), np.asarray(noff, dtype=np.int64)))
+
+
 def fit_model(X_tr, y_tr, X_va, y_va):
     """One LightGBM matcher with early stopping on the validation fold."""
     m = lgb.LGBMClassifier(**LGB_PARAMS)
@@ -295,7 +331,8 @@ def main():
     if smoke:
         s1, s23 = subsample(s1, s23, args.sample, args.sample_seed, truth)
         log(f"sampled train: {len(s1)} S1, {len(s23)} S2/S3")
-    s1, s23 = add_normalized_columns(s1), add_normalized_columns(s23)
+    s1, p1r, n1r = normalise_compact(s1)
+    s23, p2r, n2r = normalise_compact(s23)
     s1_ids_arr, s23_ids_arr = s1["entity_id"].to_numpy(), s23["entity_id"].to_numpy()
     s1_ids = s1_ids_arr.tolist()
     truth = {s: truth.get(s, set()) for s in s1_ids}
@@ -309,7 +346,7 @@ def main():
     _profile("load+normalise train")
 
     s1_fold = make_s1_folds(s1_ids, path=folds_path, seed=SEED)
-    a, b = prepare_side(s1), prepare_side(s23)
+    a, b = prepare_side(s1, p1r, n1r), prepare_side(s23, p2r, n2r)
 
     log("blocking train")
     paths, bstats = block_split(s1, s23, args.work, "train", truth=truth, s1_fold=s1_fold)
@@ -409,10 +446,11 @@ def main():
         report["sample"]["test_caveat"] = (
             "test S2/S3 sampled without truth, so most real matches are absent; "
             "pred_nonempty_share is not comparable to oof_pred_nonempty_share")
-    t1, t23 = add_normalized_columns(t1), add_normalized_columns(t23)
+    t1, tp1r, tn1r = normalise_compact(t1)
+    t23, tp2r, tn2r = normalise_compact(t23)
     t1_ids_arr, t23_ids_arr = t1["entity_id"].to_numpy(), t23["entity_id"].to_numpy()
     t_ids = t1_ids_arr.tolist()
-    ta, tb = prepare_side(t1), prepare_side(t23)
+    ta, tb = prepare_side(t1, tp1r, tn1r), prepare_side(t23, tp2r, tn2r)
 
     log("blocking test")
     tpaths, tstats = block_split(t1, t23, args.work, "test")

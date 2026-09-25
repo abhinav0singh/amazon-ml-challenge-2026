@@ -165,6 +165,16 @@ def _group_positions(rows, keys):
     return {sk[bounds[i]]: order[bounds[i]:bounds[i + 1]] for i in range(len(bounds) - 1)}
 
 
+def _postal_key(df, core_ns):
+    """Postal code + a name initial, from the compact int32 column when present."""
+    init = core_ns.str[:1].to_numpy()
+    if "postal1" in df.columns:
+        p = df["postal1"].to_numpy()
+        return np.where(p > 0, p.astype(str).astype(object) + "|" + init, "")
+    p = df["postal"].map(lambda s: min(s) if s else "").to_numpy()
+    return np.where(p != "", p.astype(object) + "|" + init, "")
+
+
 def _single(keys):
     """One key per record: (row positions, key values), blanks dropped."""
     k = np.asarray(keys, dtype=object)
@@ -223,9 +233,11 @@ def blocking_keys(df: pd.DataFrame, dfreq_name=None, dfreq_addr=None) -> dict:
     core_ns = df["name_core"].str.replace(" ", "", regex=False)
     out = {
         "pfx5": _single(core_ns.str[:5].to_numpy()),
-        "postal": _single((df["postal"].map(lambda p: min(p) if p else "")
-                           + "|" + core_ns.str[:1]).where(
-                              df["postal"].map(len) > 0, "").to_numpy()),
+        # `postal1` is one representative code as an int32, 0 meaning none.
+        # It replaces a per-record set: 12.5M Python sets cost ~5.4 GB, which
+        # exhausted a 16 GB machine before blocking could start. Fall back to
+        # the old set column if a caller has not packed it (sampled runs).
+        "postal": _single(_postal_key(df, core_ns)),
     }
     if dfreq_name is not None:
         out["nametok"] = _rare_tokens(df["name_core"].to_numpy(), dfreq_name, 3, "n:")
