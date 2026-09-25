@@ -130,13 +130,31 @@ def _fit_views(s1g, s23g):
     return mats
 
 
-def _finish(s1g, s23g, mats, ia, ib):
-    """Build the candidate frame from global row positions and attach all three
-    cosines to every pair, not only to the view that proposed it."""
+def _finish(s1g, s23g, mats, ia, ib, target_nnz=80_000_000):
+    """Build the candidate frame from row positions and attach all three cosines
+    to every pair, not only to the view that proposed it.
+
+    Computed in chunks. `A[ia]` fancy-indexes one sparse row PER PAIR, so its
+    non-zero count is len(ia) * average nnz per row. At full scale that was
+    ~53M pairs * ~50-100 nnz = billions, which overflows scipy's int32 index
+    dtype -- it computes a negative nnz and raises "negative dimensions are not
+    allowed". That killed a 2h15m run on 25 Sep. Sampled runs never reached it
+    because 40k entities produce ~2M pairs, a thousand times below the limit.
+
+    The chunk size is derived from the matrix's own density so it adapts rather
+    than relying on a constant that happens to work today.
+    """
+    n = len(ia)
     cand = pd.DataFrame({"s1_id": s1g["entity_id"].to_numpy()[ia],
                          "cand_id": s23g["entity_id"].to_numpy()[ib]})
     for name, (A, B, _) in mats.items():
-        cand[name] = np.asarray(A[ia].multiply(B[ib]).sum(axis=1)).ravel()
+        per_row = max(A.nnz / max(A.shape[0], 1), 1.0)
+        chunk = max(1, min(n, int(target_nnz / per_row)))
+        out = np.empty(n, dtype=np.float32)
+        for s in range(0, n, chunk):
+            e = min(s + chunk, n)
+            out[s:e] = np.asarray(A[ia[s:e]].multiply(B[ib[s:e]]).sum(axis=1)).ravel()
+        cand[name] = out
     return cand
 
 

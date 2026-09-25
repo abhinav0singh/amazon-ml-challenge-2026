@@ -138,6 +138,30 @@ def normalise_compact(df, chunk=1_000_000):
             (np.asarray(nflat, dtype=np.int64), np.asarray(noff, dtype=np.int64)))
 
 
+def load_or_normalise(df, work, tag):
+    """Normalise, or reload a cached normalisation from a previous run.
+
+    Normalising 12.5M records takes ~20 minutes and is entirely deterministic,
+    so a crash later in the pipeline should not cost it twice. Two runs were
+    already lost that way on 25 Sep.
+    """
+    fp = os.path.join(work, f"norm_{tag}.parquet")
+    fz = os.path.join(work, f"norm_{tag}.npz")
+    if os.path.exists(fp) and os.path.exists(fz):
+        log(f"  reusing cached normalisation for '{tag}'")
+        d = pd.read_parquet(fp)
+        z = np.load(fz)
+        return d, (z["pf"], z["po"]), (z["nf"], z["no"])
+    d, p, nm = normalise_compact(df)
+    try:
+        d.to_parquet(fp, index=False)
+        np.savez(fz, pf=p[0], po=p[1], nf=nm[0], no=nm[1])
+        log(f"  cached normalisation for '{tag}'")
+    except Exception as e:      # a cache failure must never kill the run
+        log(f"  could not cache normalisation ({e}); continuing")
+    return d, p, nm
+
+
 def fit_model(X_tr, y_tr, X_va, y_va):
     """One LightGBM matcher with early stopping on the validation fold."""
     m = lgb.LGBMClassifier(**LGB_PARAMS)
@@ -331,8 +355,8 @@ def main():
     if smoke:
         s1, s23 = subsample(s1, s23, args.sample, args.sample_seed, truth)
         log(f"sampled train: {len(s1)} S1, {len(s23)} S2/S3")
-    s1, p1r, n1r = normalise_compact(s1)
-    s23, p2r, n2r = normalise_compact(s23)
+    s1, p1r, n1r = load_or_normalise(s1, args.work, f'train_s1{args.sample}')
+    s23, p2r, n2r = load_or_normalise(s23, args.work, f'train_s23{args.sample}')
     s1_ids_arr, s23_ids_arr = s1["entity_id"].to_numpy(), s23["entity_id"].to_numpy()
     s1_ids = s1_ids_arr.tolist()
     truth = {s: truth.get(s, set()) for s in s1_ids}
@@ -446,8 +470,8 @@ def main():
         report["sample"]["test_caveat"] = (
             "test S2/S3 sampled without truth, so most real matches are absent; "
             "pred_nonempty_share is not comparable to oof_pred_nonempty_share")
-    t1, tp1r, tn1r = normalise_compact(t1)
-    t23, tp2r, tn2r = normalise_compact(t23)
+    t1, tp1r, tn1r = load_or_normalise(t1, args.work, f'test_s1{args.sample}')
+    t23, tp2r, tn2r = load_or_normalise(t23, args.work, f'test_s23{args.sample}')
     t1_ids_arr, t23_ids_arr = t1["entity_id"].to_numpy(), t23["entity_id"].to_numpy()
     t_ids = t1_ids_arr.tolist()
     ta, tb = prepare_side(t1, tp1r, tn1r), prepare_side(t23, tp2r, tn2r)
