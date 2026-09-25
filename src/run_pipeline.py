@@ -41,6 +41,7 @@ import subprocess
 import sys
 import time
 import warnings
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import lightgbm as lgb
 import numpy as np
@@ -72,6 +73,14 @@ MAX_TRAIN_PAIRS = 20_000_000
 P_KEEP = 0.15
 PRED_CHUNK = 4_000_000
 
+# Rough per-worker resident memory for process-parallel blocking (--block-workers).
+# Each worker loads ONE country's slice of the normalisation cache plus the TF-IDF
+# matrices for that group. This is an ESTIMATE used only to cap the worker count so
+# we never oversubscribe RAM; the first real run logs each worker's true peak RSS
+# (see _block_group_worker), and this number should be replaced with that measurement.
+# NOT MEASURED at full scale yet -- deliberately conservative.
+BLOCK_WORKER_GB = 3.5
+
 
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -93,9 +102,15 @@ def _profile(stage):
                         ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
                         ("PagefileUsage", ctypes.c_size_t),
                         ("PeakPagefileUsage", ctypes.c_size_t)]
+        # Declare the handle types: without restype/argtypes the -1 pseudo-handle
+        # from GetCurrentProcess is marshalled as a truncated int, the call fails
+        # silently, and the struct stays zero (which is why the [mem] lines read
+        # 0.00 GB before this fix).
+        k, ps = ctypes.windll.kernel32, ctypes.windll.psapi
+        k.GetCurrentProcess.restype = wt.HANDLE
+        ps.GetProcessMemoryInfo.argtypes = [wt.HANDLE, ctypes.POINTER(PMC), wt.DWORD]
         c = PMC(); c.cb = ctypes.sizeof(PMC)
-        ctypes.windll.psapi.GetProcessMemoryInfo(
-            ctypes.windll.kernel32.GetCurrentProcess(), ctypes.byref(c), c.cb)
+        ps.GetProcessMemoryInfo(k.GetCurrentProcess(), ctypes.byref(c), c.cb)
         log(f"  [mem] after {stage}: now {c.WorkingSetSize/1e9:.2f} GB, "
             f"peak {c.PeakWorkingSetSize/1e9:.2f} GB")
     except Exception:
@@ -290,6 +305,201 @@ def block_split(s1, s23, work, tag, truth=None, s1_fold=None):
     return paths, stats
 
 
+def _free_gb():
+    """Available physical RAM in GB (Windows GlobalMemoryStatusEx, no dependency)."""
+    try:
+        import ctypes
+
+        class MS(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+        m = MS(); m.dwLength = ctypes.sizeof(MS)
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
+        return m.ullAvailPhys / 1e9
+    except Exception:
+        return float("inf")     # unknown -> do not let the guard block anything
+
+
+def _peak_rss_gb():
+    """This process's peak working set in GB, for the per-worker memory report."""
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+
+        class PMC(ctypes.Structure):
+            _fields_ = [("cb", wt.DWORD), ("PageFaultCount", wt.DWORD),
+                        ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                        ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t)]
+        k, ps = ctypes.windll.kernel32, ctypes.windll.psapi
+        k.GetCurrentProcess.restype = wt.HANDLE   # else the pseudo-handle truncates
+        ps.GetProcessMemoryInfo.argtypes = [wt.HANDLE, ctypes.POINTER(PMC), wt.DWORD]
+        c = PMC(); c.cb = ctypes.sizeof(PMC)
+        ps.GetProcessMemoryInfo(k.GetCurrentProcess(), ctypes.byref(c), c.cb)
+        return c.PeakWorkingSetSize / 1e9
+    except Exception:
+        return 0.0
+
+
+def _load_norm_cache(work, tag):
+    """Read a normalisation cache back from disk (the cache-hit half of
+    load_or_normalise, without the raw frame it would otherwise need). Used to
+    reload the split frames in the PARENT after parallel blocking, once the
+    workers -- which read their slices straight from the same cache -- are done."""
+    d = pd.read_parquet(os.path.join(work, f"norm_{tag}.parquet"))
+    z = np.load(os.path.join(work, f"norm_{tag}.npz"))
+    return d, (z["pf"], z["po"]), (z["nf"], z["no"])
+
+
+def _block_group_worker(country, s1_pq, s23_pq, out_dir, tag, truth_sub, fold_sub):
+    """Block ONE country group in a separate process and spill its pair frame.
+
+    This reproduces exactly what block_split's per-group body does, but the
+    worker owns no large parent state: it reads its own country slice from the
+    normalisation cache parquet, so nothing large is ever pickled across the
+    process boundary. The output parquet is byte-for-position identical to the
+    serial path -- same GLOBAL integer positions, same columns, same order --
+    which is the whole correctness requirement, since downstream stages index
+    the full-split arrays by those positions.
+
+    The one subtlety: the cache slice gives LOCAL row positions, but the stored
+    ia/ib must be GLOBAL (positions into the full split, matching s1_ids_arr).
+    gpos maps local -> global; context-feature VALUES are position-invariant
+    (grouping is a bijection within a group and is_s3 is per-record), so they
+    are computed locally and only ia/ib are remapped.
+
+    Returns a stats dict; path is None when the group produced no candidates.
+    """
+    import pyarrow.parquet as pq
+
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from blocking import generate_candidates
+    from pair_features import add_context_features
+
+    want = ["entity_id", "country_n", "name_core", "full_n", "addr_n", "postal1"]
+    have = set(pq.ParquetFile(s1_pq).schema.names)
+    cols = [c for c in want if c in have]
+
+    def slice_of(path, allow_fallback):
+        cn = pd.read_parquet(path, columns=["country_n"])["country_n"].to_numpy()
+        mask = cn == country
+        if not mask.any() and allow_fallback:      # country absent on this side
+            return pd.read_parquet(path, columns=cols).reset_index(drop=True), \
+                   np.arange(len(cn), dtype=np.int64)
+        g = pd.read_parquet(path, columns=cols,
+                            filters=[("country_n", "==", country)]).reset_index(drop=True)
+        return g, np.flatnonzero(mask).astype(np.int64)
+
+    s1g, gpos1 = slice_of(s1_pq, allow_fallback=False)
+    s23g, gpos23 = slice_of(s23_pq, allow_fallback=True)
+
+    st = {"country": country, "path": None, "n_pairs": 0,
+          "hit": 0, "tot": 0, "cover_num": 0, "cover_den": 0, "peak_gb": 0.0}
+
+    cand = generate_candidates(s1g, s23g, by_country=False)
+    if cand.empty:
+        st["peak_gb"] = _peak_rss_gb()
+        return st
+
+    pos1 = pd.Series(np.arange(len(s1g)), index=s1g["entity_id"].to_numpy())
+    pos23 = pd.Series(np.arange(len(s23g)), index=s23g["entity_id"].to_numpy())
+    ia_l = pos1.loc[cand["s1_id"]].to_numpy()
+    ib_l = pos23.loc[cand["cand_id"]].to_numpy()
+    ia_g = gpos1[ia_l].astype(np.int32)     # int32 to match the serial path exactly
+    ib_g = gpos23[ib_l].astype(np.int32)
+    b_is_s3 = s23g["entity_id"].str.startswith("S3").to_numpy().astype(np.float32)
+
+    if truth_sub is not None:               # blocking quality, before anything is dropped
+        cset = cand.groupby("s1_id")["cand_id"].agg(set)
+        st["cover_den"] = len(s1g)
+        for s in s1g["entity_id"]:
+            t = truth_sub.get(s, set())
+            got = cset.get(s, set())
+            st["tot"] += len(t); st["hit"] += len(t & got); st["cover_num"] += (t <= got)
+
+    y = None
+    if truth_sub is not None:
+        y = np.fromiter((cid in truth_sub.get(sid, ()) for sid, cid
+                         in zip(cand["s1_id"], cand["cand_id"])), dtype=np.int8, count=len(cand))
+
+    frame = pd.DataFrame({"s1_id": ia_g, "cand_id": ib_g,
+                          "cos_name": cand["cos_name"].to_numpy(np.float32),
+                          "cos_full": cand["cos_full"].to_numpy(np.float32),
+                          "cos_addr": cand["cos_addr"].to_numpy(np.float32)})
+    # is_s3 is looked up with LOCAL ib into a LOCAL flag array (same record, same
+    # value); the rank/competition groupbys use the frame's own s1_id/cand_id,
+    # which hold GLOBAL positions -- identical grouping to the serial path.
+    add_context_features(frame, b_is_s3, ib_l)
+    frame = frame.rename(columns={"s1_id": "ia", "cand_id": "ib"})
+    if y is not None:
+        frame["y"] = y
+        frame["fold"] = pd.Series(cand["s1_id"].map(fold_sub).to_numpy()).astype(np.int8)
+
+    st["n_pairs"] = len(frame)
+    p = os.path.join(out_dir, f"pairs_{tag}_{country or 'na'}.parquet")
+    frame.to_parquet(p, index=False)
+    st["path"] = p
+    st["peak_gb"] = _peak_rss_gb()
+    return st
+
+
+def _plan_block_workers(requested, n_groups):
+    """Effective worker count: never more than groups, never more than RAM allows.
+
+    Falls back to 1 (i.e. the serial block_split) when the machine is tight or
+    there is only one group, so parallelism is opt-in AND self-limiting. The RAM
+    cap uses BLOCK_WORKER_GB, a conservative estimate -- replace it with the
+    measured per-worker peak once a real run has reported one."""
+    if requested <= 1 or n_groups <= 1:
+        return 1
+    free = _free_gb()
+    ram_cap = max(1, int(free / BLOCK_WORKER_GB))
+    w = min(requested, n_groups, ram_cap)
+    log(f"  block workers: requested {requested}, groups {n_groups}, free RAM "
+        f"{free:.1f} GB (~{BLOCK_WORKER_GB} GB/worker -> cap {ram_cap}) -> using {w}")
+    if w <= 1:
+        log("  falling back to serial blocking (RAM too tight for >1 worker)")
+    return w
+
+
+def block_split_parallel(work, tag, s1_pq, s23_pq, countries, s1_len,
+                         truth_by_country, fold_by_country, max_workers):
+    """Process-parallel counterpart of block_split: one worker per country group.
+
+    Each worker loads its slice from the cache and writes its own pairs_*.parquet
+    (§9), so the parent holds no split frames during this window -- the caller is
+    expected to have released them first and to reload from the same cache after.
+    Stats are aggregated to match block_split's return shape exactly."""
+    paths = []
+    agg = {"n_pairs": 0, "hit": 0, "tot": 0, "cover_num": 0, "cover_den": 0}
+    peak = 0.0
+    with ProcessPoolExecutor(max_workers=max_workers) as ex:
+        futs = {ex.submit(_block_group_worker, c, s1_pq, s23_pq, work, tag,
+                          None if truth_by_country is None else truth_by_country.get(c),
+                          None if fold_by_country is None else fold_by_country.get(c)): c
+                for c in countries}
+        for fut in as_completed(futs):
+            st = fut.result()
+            if st["path"]:
+                paths.append(st["path"])
+            for k in agg:
+                agg[k] += st[k]
+            peak = max(peak, st["peak_gb"])
+            log(f"  [parallel] '{st['country']}' done: {st['n_pairs']:,} pairs, "
+                f"worker peak {st['peak_gb']:.2f} GB")
+    log(f"  [parallel] max worker peak RSS {peak:.2f} GB across {max_workers} workers "
+        f"(x{max_workers} concurrent -> budget ~{peak * max_workers:.1f} GB)")
+    stats = {"total_pairs": int(agg["n_pairs"]), "avg_cands_per_s1": agg["n_pairs"] / max(s1_len, 1)}
+    if truth_by_country is not None:
+        stats["pair_recall_ceiling"] = agg["hit"] / agg["tot"] if agg["tot"] else 1.0
+        stats["entity_full_cover"] = agg["cover_num"] / max(agg["cover_den"], 1)
+    return paths, stats
+
+
 def predict_paths(paths, models, a, b, fold_col=None):
     """Stream every spilled pair frame through the model(s).
 
@@ -356,6 +566,10 @@ def main():
     ap.add_argument("--sample-seed", type=int, default=SEED)
     ap.add_argument("--skip-test", action="store_true",
                     help="stop after CV; produces no submission files")
+    ap.add_argument("--block-workers", type=int, default=1, metavar="N",
+                    help="blocking parallelism across country groups, using PROCESSES "
+                         "(threads segfault rapidfuzz). 1 = serial (default). The count is "
+                         "capped by group count and free RAM; see _plan_block_workers.")
     args = ap.parse_args()
     os.makedirs(args.work, exist_ok=True)
     report = {}
@@ -391,12 +605,33 @@ def main():
     _profile("load+normalise train")
 
     s1_fold = make_s1_folds(s1_ids, path=folds_path, seed=SEED)
-    a, b = prepare_side(s1, p1r, n1r), prepare_side(s23, p2r, n2r)
 
     log("blocking train")
-    paths, bstats = block_split(s1, s23, args.work, "train", truth=truth, s1_fold=s1_fold)
+    workers = _plan_block_workers(args.block_workers, s1["country_n"].nunique())
+    if workers > 1:
+        # Parallel: workers read their slices from the cache, so free the parent's
+        # frames first (they would otherwise sit alongside every worker's slice and
+        # blow the RAM budget), then reload from the same cache for the feature stage.
+        s1_pq = os.path.join(args.work, f"norm_train_s1{args.sample}.parquet")
+        s23_pq = os.path.join(args.work, f"norm_train_s23{args.sample}.parquet")
+        tbc, fbc = {}, {}
+        for c, g in s1.groupby("country_n"):
+            ids = g["entity_id"].to_numpy()
+            tbc[c] = {s: truth.get(s, set()) for s in ids}
+            fbc[c] = {s: s1_fold.get(s) for s in ids}
+        s1_len = len(s1)
+        del s1, s23, p1r, n1r, p2r, n2r
+        gc.collect()
+        paths, bstats = block_split_parallel(args.work, "train", s1_pq, s23_pq,
+                                             list(tbc.keys()), s1_len, tbc, fbc, workers)
+        s1, p1r, n1r = _load_norm_cache(args.work, f"train_s1{args.sample}")
+        s23, p2r, n2r = _load_norm_cache(args.work, f"train_s23{args.sample}")
+    else:
+        paths, bstats = block_split(s1, s23, args.work, "train", truth=truth, s1_fold=s1_fold)
     report["blocking_train"] = bstats
     log(f"blocking: {bstats}")
+
+    a, b = prepare_side(s1, p1r, n1r), prepare_side(s23, p2r, n2r)
 
     # ---------- training sample ----------
     log("assembling training sample")
@@ -495,11 +730,27 @@ def main():
     t23, tp2r, tn2r = load_or_normalise(t23, args.work, f'test_s23{args.sample}')
     t1_ids_arr, t23_ids_arr = t1["entity_id"].to_numpy(), t23["entity_id"].to_numpy()
     t_ids = t1_ids_arr.tolist()
-    ta, tb = prepare_side(t1, tp1r, tn1r), prepare_side(t23, tp2r, tn2r)
 
     log("blocking test")
-    tpaths, tstats = block_split(t1, t23, args.work, "test")
+    tworkers = _plan_block_workers(args.block_workers, t1["country_n"].nunique())
+    if tworkers > 1:
+        # Test has up to three groups (US / India / France), so it gains most from
+        # parallelism. No truth on the test side -> no y, no fold, no recall stats.
+        t1_pq = os.path.join(args.work, f"norm_test_s1{args.sample}.parquet")
+        t23_pq = os.path.join(args.work, f"norm_test_s23{args.sample}.parquet")
+        tcountries = list(t1["country_n"].unique())
+        t1_len = len(t1)
+        del t1, t23, tp1r, tn1r, tp2r, tn2r
+        gc.collect()
+        tpaths, tstats = block_split_parallel(args.work, "test", t1_pq, t23_pq,
+                                              tcountries, t1_len, None, None, tworkers)
+        t1, tp1r, tn1r = _load_norm_cache(args.work, f"test_s1{args.sample}")
+        t23, tp2r, tn2r = _load_norm_cache(args.work, f"test_s23{args.sample}")
+    else:
+        tpaths, tstats = block_split(t1, t23, args.work, "test")
     report["blocking_test"] = tstats
+
+    ta, tb = prepare_side(t1, tp1r, tn1r), prepare_side(t23, tp2r, tn2r)
 
     # candidate_pairs.tsv must be the FINAL candidate list the model scores, so it
     # is written from the same spilled frames, streamed rather than held in memory.
