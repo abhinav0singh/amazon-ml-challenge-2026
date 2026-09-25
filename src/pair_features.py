@@ -9,86 +9,180 @@ Groups of features:
   * postal code / number agreement
   * context: how this candidate ranks among the S1's candidates, and how this
     S1 ranks among all S1s that proposed the same candidate (competition)
+
+MEMORY AND SPEED
+----------------
+At full scale there are of order 10^8 candidate pairs, so this module never
+builds a pair-length frame of strings. Two rules make that work:
+
+  * Records are addressed by integer POSITION into the side arrays. The old
+    `s1.set_index("entity_id").loc[cand["s1_id"]]` materialised one row of
+    object-dtype columns per pair -- hundreds of GB at full scale.
+  * String similarities are computed with `rapidfuzz.process.cpdist`, which
+    compares aligned pairs element-wise in C across all cores, instead of a
+    Python loop making 16 calls per pair.
+
+Context features are computed once on the (comparatively small) candidate
+frame; string features are computed per chunk so the caller can consume and
+discard them. See `iter_string_features`.
 """
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from rapidfuzz import fuzz
+from rapidfuzz import fuzz, process
 from rapidfuzz.distance import JaroWinkler
 
-FEATURES = [
+# Context features come from the candidate frame; string features are computed
+# per chunk. The model consumes them in this order, so the order is part of the
+# contract between this module and run_pipeline.
+CONTEXT_FEATURES = [
     "cos_name", "cos_full", "cos_addr",
-    "nm_ratio", "nm_tsort", "nm_tset", "nm_partial", "nm_jw",
-    "core_ratio", "core_tset", "core_jw", "core_first_tok_eq", "core_len_diff",
-    "ad_ratio", "ad_tset", "ad_partial",
-    "postal_match", "num_jacc", "num_overlap",
     "is_s3", "n_cands",
     "rank_name_in_s1", "gap_name_to_best", "rank_full_in_s1", "gap_full_to_best",
     "rank_s1_for_cand", "n_s1_for_cand", "gap_to_best_s1_for_cand",
 ]
+STRING_FEATURES = [
+    "nm_ratio", "nm_tsort", "nm_tset", "nm_partial", "nm_jw",
+    "core_ratio", "core_tset", "core_jw", "core_first_tok_eq", "core_len_diff",
+    "ad_ratio", "ad_tset", "ad_partial",
+    "postal_match", "num_jacc", "num_overlap",
+]
+FEATURES = CONTEXT_FEATURES + STRING_FEATURES
+
+# (output name, source column, rapidfuzz scorer). Each becomes one cpdist call.
+_SCORERS = [
+    ("nm_ratio", "name_n", fuzz.ratio),
+    ("nm_tsort", "name_n", fuzz.token_sort_ratio),
+    ("nm_tset", "name_n", fuzz.token_set_ratio),
+    ("nm_partial", "name_n", fuzz.partial_ratio),
+    ("nm_jw", "name_n", JaroWinkler.similarity),
+    ("core_ratio", "name_core", fuzz.ratio),
+    ("core_tset", "name_core", fuzz.token_set_ratio),
+    ("core_jw", "name_core", JaroWinkler.similarity),
+    ("ad_ratio", "addr_n", fuzz.ratio),
+    ("ad_tset", "addr_n", fuzz.token_set_ratio),
+    ("ad_partial", "addr_n", fuzz.partial_ratio),
+]
 
 
-def _jacc(a: set, b: set) -> float:
-    return len(a & b) / len(a | b) if (a or b) else -1.0
+def prepare_side(df: pd.DataFrame) -> dict:
+    """Pack one side's normalised columns into position-indexed numpy arrays.
+
+    Done once per split. Everything downstream indexes these by integer
+    position, so no pair-length string structure is ever built.
+    """
+    core = df["name_core"].to_numpy()
+    return {
+        "name_n": df["name_n"].to_numpy(),
+        "name_core": core,
+        "addr_n": df["addr_n"].to_numpy(),
+        # first token and length are cheap scalars, precomputed per record
+        "first_tok": np.array([c.split(" ", 1)[0] if c else "" for c in core], dtype=object),
+        "core_len": np.array([len(c) for c in core], dtype=np.float32),
+        "postal": df["postal"].to_numpy(),
+        "nums": df["nums"].to_numpy(),
+        "is_s3": df["entity_id"].str.startswith("S3").to_numpy().astype(np.float32),
+    }
+
+
+def add_context_features(cand: pd.DataFrame, b_is_s3: np.ndarray, ib: np.ndarray) -> pd.DataFrame:
+    """Rank/competition features, computed on the candidate frame itself.
+
+    These need a groupby over all of an entity's candidates, so they cannot be
+    computed chunk-wise. They are cheap: no strings, just float32 columns.
+    `cos_*` must already be present (blocking attaches them).
+    """
+    cand["is_s3"] = b_is_s3[ib]
+    g = cand.groupby("s1_id", observed=True)
+    cand["n_cands"] = g["cand_id"].transform("size").astype(np.float32)
+    for c, short in [("cos_name", "name"), ("cos_full", "full")]:
+        cand[f"rank_{short}_in_s1"] = g[c].rank(ascending=False, method="min").astype(np.float32)
+        cand[f"gap_{short}_to_best"] = (g[c].transform("max") - cand[c]).astype(np.float32)
+    # Competition between S1 records for the same candidate (Source 1 is
+    # deduplicated, and measured on train NO S2/S3 record belongs to two S1
+    # entities, so a candidate wanted by several entities is a contested one).
+    gc = cand.groupby("cand_id", observed=True)
+    cand["rank_s1_for_cand"] = gc["cos_full"].rank(ascending=False, method="min").astype(np.float32)
+    cand["n_s1_for_cand"] = gc["s1_id"].transform("size").astype(np.float32)
+    cand["gap_to_best_s1_for_cand"] = (gc["cos_full"].transform("max") - cand["cos_full"]).astype(np.float32)
+    return cand
+
+
+def string_features(ia: np.ndarray, ib: np.ndarray, a: dict, b: dict,
+                    workers: int = 1) -> np.ndarray:
+    # workers=1 is deliberate. rapidfuzz 3.9.6's multi-threaded cpdist crashes
+    # with a Windows access violation on this data (reproducible at 60k pairs;
+    # it survives small toy inputs, which is why it is easy to miss). Single
+    # threaded it still does 60k pairs per scorer in 0.05s -- roughly 27 min
+    # for the full test set across all 11 scorers -- so the parallelism is not
+    # worth a segfault mid-run. Revisit only with a newer rapidfuzz.
+    """The 16 string features for one chunk of aligned pairs.
+
+    `ia`/`ib` are integer positions into the side dicts from `prepare_side`.
+    Returns a (len(ia), 16) float32 array, columns in STRING_FEATURES order.
+    """
+    n = len(ia)
+    out = np.empty((n, len(STRING_FEATURES)), dtype=np.float32)
+    col = {name: i for i, name in enumerate(STRING_FEATURES)}
+
+    for name, src, scorer in _SCORERS:
+        qa, qb = a[src][ia], b[src][ib]
+        out[:, col[name]] = process.cpdist(qa, qb, scorer=scorer, workers=workers,
+                                           dtype=np.float32)
+
+    # An address missing on either side means "unknown", not "different".
+    miss = (a["addr_n"][ia] == "") | (b["addr_n"][ib] == "")
+    for name in ("ad_ratio", "ad_tset", "ad_partial"):
+        out[miss, col[name]] = -1.0
+
+    out[:, col["core_first_tok_eq"]] = (a["first_tok"][ia] == b["first_tok"][ib]).astype(np.float32)
+    out[:, col["core_len_diff"]] = np.abs(a["core_len"][ia] - b["core_len"][ib])
+
+    # Set-valued features. Still a Python loop, but over 3 cheap set operations
+    # per pair rather than 16 string comparisons, and the sets are tiny.
+    ap, bp = a["postal"], b["postal"]
+    au, bu = a["nums"], b["nums"]
+    pm = out[:, col["postal_match"]]
+    nj = out[:, col["num_jacc"]]
+    no = out[:, col["num_overlap"]]
+    for i in range(n):
+        x, y = ap[ia[i]], bp[ib[i]]
+        pm[i] = -1.0 if not (x and y) else float(not x.isdisjoint(y))
+        x, y = au[ia[i]], bu[ib[i]]
+        if x or y:
+            inter = len(x & y)
+            nj[i] = inter / len(x | y)
+            no[i] = inter
+        else:
+            nj[i] = -1.0
+            no[i] = 0.0
+    return out
+
+
+def iter_string_features(ia: np.ndarray, ib: np.ndarray, a: dict, b: dict,
+                         chunk: int = 4_000_000):
+    """Yield (start, stop, features) so the caller can predict and discard.
+
+    Holding every string feature for every pair is the single largest memory
+    cost in the pipeline; streaming them is what keeps it inside a laptop.
+    """
+    for start in range(0, len(ia), chunk):
+        stop = min(start + chunk, len(ia))
+        yield start, stop, string_features(ia[start:stop], ib[start:stop], a, b)
 
 
 def build_pair_features(cand: pd.DataFrame, s1: pd.DataFrame, s23: pd.DataFrame) -> pd.DataFrame:
-    """cand: output of blocking (s1_id, cand_id, cos_*). s1/s23: normalised records.
-    Returns cand with every column in FEATURES added."""
-    a = s1.set_index("entity_id").loc[cand["s1_id"]]
-    b = s23.set_index("entity_id").loc[cand["cand_id"]]
+    """Full in-memory build. Convenient for sampled runs and for tests; at full
+    scale use `add_context_features` plus `iter_string_features` instead."""
+    a, b = prepare_side(s1), prepare_side(s23)
+    pos1 = pd.Series(np.arange(len(s1)), index=s1["entity_id"].to_numpy())
+    pos23 = pd.Series(np.arange(len(s23)), index=s23["entity_id"].to_numpy())
+    ia = pos1.loc[cand["s1_id"]].to_numpy()
+    ib = pos23.loc[cand["cand_id"]].to_numpy()
     df = cand.reset_index(drop=True).copy()
-
-    an, bn = a["name_n"].to_numpy(), b["name_n"].to_numpy()
-    ac, bc = a["name_core"].to_numpy(), b["name_core"].to_numpy()
-    aa, ba = a["addr_n"].to_numpy(), b["addr_n"].to_numpy()
-    ap, bp = a["postal"].to_numpy(), b["postal"].to_numpy()
-    au, bu = a["nums"].to_numpy(), b["nums"].to_numpy()
-
-    n = len(df)
-    cols = {c: np.empty(n, dtype=np.float32) for c in [
-        "nm_ratio", "nm_tsort", "nm_tset", "nm_partial", "nm_jw", "core_ratio", "core_tset",
-        "core_jw", "core_first_tok_eq", "core_len_diff", "ad_ratio", "ad_tset", "ad_partial",
-        "postal_match", "num_jacc", "num_overlap"]}
-    for i in range(n):
-        x, y = an[i], bn[i]
-        cols["nm_ratio"][i] = fuzz.ratio(x, y)
-        cols["nm_tsort"][i] = fuzz.token_sort_ratio(x, y)
-        cols["nm_tset"][i] = fuzz.token_set_ratio(x, y)
-        cols["nm_partial"][i] = fuzz.partial_ratio(x, y)
-        cols["nm_jw"][i] = JaroWinkler.similarity(x, y)
-        x, y = ac[i], bc[i]
-        cols["core_ratio"][i] = fuzz.ratio(x, y)
-        cols["core_tset"][i] = fuzz.token_set_ratio(x, y)
-        cols["core_jw"][i] = JaroWinkler.similarity(x, y)
-        xs, ys = x.split(), y.split()
-        cols["core_first_tok_eq"][i] = float(bool(xs) and bool(ys) and xs[0] == ys[0])
-        cols["core_len_diff"][i] = abs(len(x) - len(y))
-        x, y = aa[i], ba[i]
-        if x and y:
-            cols["ad_ratio"][i] = fuzz.ratio(x, y)
-            cols["ad_tset"][i] = fuzz.token_set_ratio(x, y)
-            cols["ad_partial"][i] = fuzz.partial_ratio(x, y)
-        else:  # one address missing: say "unknown" rather than "different"
-            cols["ad_ratio"][i] = cols["ad_tset"][i] = cols["ad_partial"][i] = -1
-        pa, pb = ap[i], bp[i]
-        cols["postal_match"][i] = -1.0 if not (pa and pb) else float(bool(pa & pb))
-        cols["num_jacc"][i] = _jacc(au[i], bu[i])
-        cols["num_overlap"][i] = len(au[i] & bu[i])
-    for k, v in cols.items():
-        df[k] = v
-
-    df["is_s3"] = df["cand_id"].str.startswith("S3").astype(np.float32)
-    g = df.groupby("s1_id")
-    df["n_cands"] = g["cand_id"].transform("size").astype(np.float32)
-    for c, short in [("cos_name", "name"), ("cos_full", "full")]:
-        df[f"rank_{short}_in_s1"] = g[c].rank(ascending=False, method="min").astype(np.float32)
-        df[f"gap_{short}_to_best"] = (g[c].transform("max") - df[c]).astype(np.float32)
-    # Competition between S1 records for the same candidate (Source 1 is deduplicated,
-    # so a record usually belongs to at most one S1 entity).
-    gc = df.groupby("cand_id")
-    df["rank_s1_for_cand"] = gc["cos_full"].rank(ascending=False, method="min").astype(np.float32)
-    df["n_s1_for_cand"] = gc["s1_id"].transform("size").astype(np.float32)
-    df["gap_to_best_s1_for_cand"] = (gc["cos_full"].transform("max") - df["cos_full"]).astype(np.float32)
+    add_context_features(df, b["is_s3"], ib)
+    sf = string_features(ia, ib, a, b)
+    for j, name in enumerate(STRING_FEATURES):
+        df[name] = sf[:, j]
     return df

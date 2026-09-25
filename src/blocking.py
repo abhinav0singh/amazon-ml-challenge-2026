@@ -188,7 +188,12 @@ def _rare_tokens(series, doc_freq, n_tok, prefix):
         t = s.split()
         if not t:
             continue
-        for tok in sorted(set(t), key=lambda x: doc_freq.get(x, 0))[:n_tok]:
+        # Tie-break on the token itself. Sorting on frequency alone left ties
+        # broken by set iteration order, which varies run to run with Python's
+        # string hash randomisation -- identical runs produced 38,319 / 38,325 /
+        # 38,331 candidate pairs. Blocking must be reproducible or no
+        # before/after comparison means anything.
+        for tok in sorted(set(t), key=lambda x: (doc_freq.get(x, 0), x))[:n_tok]:
             rows.append(i)
             keys.append(prefix + tok)
     return np.asarray(rows, dtype=np.int64), np.asarray(keys, dtype=object)
