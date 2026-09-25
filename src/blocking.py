@@ -42,6 +42,29 @@ CHUNK_ROWS = 2048
 # the candidate-generation design is settled; revisit once it is.
 MAX_DF, MIN_DF = 0.01, 2
 
+# Multi-key blocking: partition into many small blocks by several complementary
+# keys and match inside each, instead of ranking against a whole country group.
+# Turns the cost from roughly quadratic into roughly linear. MAX_BLOCK caps the
+# S2/S3 side of any one block; oversized blocks come from low-information keys,
+# would dominate the runtime, and are covered by the other keys.
+MULTIKEY = True
+MAX_BLOCK = 20000
+
+# Cap on candidates kept per S1 entity after the key blocks are unioned.
+# Unioning several keys makes candidates per entity grow with corpus size
+# (19 -> 40 -> 61 at samples 2k -> 10k -> 40k), which is cost the feature stage
+# has to absorb. This IS the final candidate list, so it is also what
+# candidate_pairs.tsv must contain.
+#
+# MEASURED at 40k: cap 40 cut candidates 60.6 -> 38.1 per entity but cost
+# entity cover 0.9546 -> 0.9208. That is far too expensive -- cover is close to
+# a hard cap on macro F0.5, and now that blocking cost is sub-linear we are no
+# longer desperate for the saving. 80 is set so the cap does not bind at any
+# scale measured so far (so it costs nothing observed) while still bounding the
+# worst case at full scale. Tune with real numbers, not intuition -- see the B
+# blocking issue.
+MAX_CANDS = 80
+
 
 def _topk_sparse(A, B, k, chunk_rows=CHUNK_ROWS):
     """For each row of A, the indices of its top-k most similar rows in B.
@@ -78,16 +101,20 @@ def _topk_sparse(A, B, k, chunk_rows=CHUNK_ROWS):
     return np.concatenate(rows_out), np.concatenate(cols_out)
 
 
-def _block_group(s1g, s23g):
-    """Candidates for one country group. Returns a long DataFrame of
-    (s1_id, cand_id, cos_name, cos_full, cos_addr)."""
-    specs = [
-        ("cos_name", "name_core", dict(analyzer="char_wb", ngram_range=(2, 4)), K_NAME),
-        ("cos_full", "full_n", dict(analyzer="char_wb", ngram_range=(3, 4)), K_FULL),
-        ("cos_addr", "addr_n", dict(analyzer="word", ngram_range=(1, 2)), K_ADDR),
-    ]
-    pieces, mats = [], {}
-    for name, col, vec_kw, k in specs:
+SPECS = [
+    ("cos_name", "name_core", dict(analyzer="char_wb", ngram_range=(2, 4)), "K_NAME"),
+    ("cos_full", "full_n", dict(analyzer="char_wb", ngram_range=(3, 4)), "K_FULL"),
+    ("cos_addr", "addr_n", dict(analyzer="word", ngram_range=(1, 2)), "K_ADDR"),
+]
+
+
+def _fit_views(s1g, s23g):
+    """Fit the three TF-IDF views ONCE for a country group and transform both
+    sides. Fitting per block would make cosines from different blocks sit on
+    different scales, which would silently corrupt the cos_* features and every
+    rank_/gap_ feature derived from them."""
+    mats = {}
+    for name, col, vec_kw, kname in SPECS:
         text = pd.concat([s1g[col], s23g[col]])
         vec = TfidfVectorizer(sublinear_tf=True, dtype=np.float32,
                               max_df=MAX_DF, min_df=MIN_DF, **vec_kw)
@@ -99,34 +126,174 @@ def _block_group(s1g, s23g):
             # back to no pruning: small groups are cheap to match exhaustively.
             vec = TfidfVectorizer(sublinear_tf=True, dtype=np.float32, min_df=1, **vec_kw)
             vec.fit(text)
-        A, B = vec.transform(s1g[col]), vec.transform(s23g[col])
-        mats[name] = (A, B)
-        rows, cols = _topk_sparse(A, B, k)
-        pieces.append(pd.DataFrame({
-            "s1_id": s1g["entity_id"].to_numpy()[rows],
-            "cand_id": s23g["entity_id"].to_numpy()[cols],
-        }))
-    cand = pd.concat(pieces, ignore_index=True).drop_duplicates().reset_index(drop=True)
+        mats[name] = (vec.transform(s1g[col]), vec.transform(s23g[col]), globals()[kname])
+    return mats
 
-    # All three cosines for EVERY candidate pair (not only the list that proposed it)
-    ia = pd.Series(np.arange(len(s1g)), index=s1g["entity_id"].to_numpy()).loc[cand["s1_id"]].to_numpy()
-    ib = pd.Series(np.arange(len(s23g)), index=s23g["entity_id"].to_numpy()).loc[cand["cand_id"]].to_numpy()
-    for name, (A, B) in mats.items():
+
+def _finish(s1g, s23g, mats, ia, ib):
+    """Build the candidate frame from global row positions and attach all three
+    cosines to every pair, not only to the view that proposed it."""
+    cand = pd.DataFrame({"s1_id": s1g["entity_id"].to_numpy()[ia],
+                         "cand_id": s23g["entity_id"].to_numpy()[ib]})
+    for name, (A, B, _) in mats.items():
         cand[name] = np.asarray(A[ia].multiply(B[ib]).sum(axis=1)).ravel()
     return cand
 
 
-def generate_candidates(s1: pd.DataFrame, s23: pd.DataFrame, by_country: bool = True) -> pd.DataFrame:
+def _block_group(s1g, s23g):
+    """Candidates for one country group, ranking against the WHOLE group.
+    Correct but roughly quadratic; kept as the reference implementation and for
+    small groups. Returns (s1_id, cand_id, cos_name, cos_full, cos_addr)."""
+    mats = _fit_views(s1g, s23g)
+    seen = []
+    for name, (A, B, k) in mats.items():
+        rows, cols = _topk_sparse(A, B, k)
+        seen.append(np.stack([rows, cols], axis=1))
+    pairs = np.unique(np.concatenate(seen), axis=0)
+    return _finish(s1g, s23g, mats, pairs[:, 0], pairs[:, 1])
+
+
+def _group_positions(rows, keys):
+    """Map each key value to the array of row positions carrying it, via one
+    sort rather than a pandas groupby (much cheaper at these sizes). `rows` and
+    `keys` are parallel arrays, so a row may appear under several keys."""
+    if len(rows) == 0:
+        return {}
+    order = np.argsort(keys, kind="stable")
+    order, sk = np.asarray(rows)[order], np.asarray(keys)[order]
+    bounds = np.flatnonzero(np.r_[True, sk[1:] != sk[:-1], True])
+    return {sk[bounds[i]]: order[bounds[i]:bounds[i + 1]] for i in range(len(bounds) - 1)}
+
+
+def _single(keys):
+    """One key per record: (row positions, key values), blanks dropped."""
+    k = np.asarray(keys, dtype=object)
+    r = np.flatnonzero(k != "")
+    return r, k[r]
+
+
+def _rare_tokens(series, doc_freq, n_tok, prefix):
+    """Index each record under its `n_tok` RAREST tokens.
+
+    This is the workhorse key. Exact whole-name keys are brittle against the
+    noise this dataset is built from -- typos, reordering, abbreviation, DBA
+    names -- because any one of those breaks the whole key. Indexing by the
+    rarest individual tokens only needs ONE distinctive word to survive, and
+    rare tokens are both the most identifying and the cheapest to look up
+    (short posting lists). Common tokens are skipped precisely because they
+    would form huge blocks and carry little information.
+    """
+    rows, keys = [], []
+    for i, s in enumerate(series):
+        t = s.split()
+        if not t:
+            continue
+        for tok in sorted(set(t), key=lambda x: doc_freq.get(x, 0))[:n_tok]:
+            rows.append(i)
+            keys.append(prefix + tok)
+    return np.asarray(rows, dtype=np.int64), np.asarray(keys, dtype=object)
+
+
+def _doc_freq(*series_list):
+    """Token document frequency over both sides, so 'rare' means rare in the
+    corpus being matched rather than in one side of it."""
+    c = {}
+    for series in series_list:
+        for s in series:
+            for tok in set(s.split()):
+                c[tok] = c.get(tok, 0) + 1
+    return c
+
+
+def blocking_keys(df: pd.DataFrame, dfreq_name=None, dfreq_addr=None) -> dict:
+    """Complementary blocking schemes, all derived from the record itself
+    (no external data, no country branching). Each returns (rows, keys), and a
+    record may appear under several keys of the same scheme.
+
+    A true match survives if it shares ANY key, so the schemes are chosen to
+    fail independently: rare name tokens survive reordering and suffix noise,
+    the name prefix survives a mangled interior, rare address tokens survive a
+    renamed business, and the postal key is decisive when a code is present.
+    """
+    core_ns = df["name_core"].str.replace(" ", "", regex=False)
+    out = {
+        "pfx5": _single(core_ns.str[:5].to_numpy()),
+        "postal": _single((df["postal"].map(lambda p: min(p) if p else "")
+                           + "|" + core_ns.str[:1]).where(
+                              df["postal"].map(len) > 0, "").to_numpy()),
+    }
+    if dfreq_name is not None:
+        out["nametok"] = _rare_tokens(df["name_core"].to_numpy(), dfreq_name, 3, "n:")
+    if dfreq_addr is not None:
+        out["addrtok"] = _rare_tokens(df["addr_n"].to_numpy(), dfreq_addr, 2, "a:")
+    return out
+
+
+def _block_by_keys(s1: pd.DataFrame, s23: pd.DataFrame, max_block: int = MAX_BLOCK) -> pd.DataFrame:
+    """O(n) candidate generation: partition both sides by each key, run the
+    top-k cosine matcher inside each small block, union the results.
+
+    Cost is driven by the sum of (block s1 size x block s23 size) rather than
+    the whole country group, so it grows roughly linearly with the data instead
+    of quadratically. Blocks larger than `max_block` on the S2/S3 side are
+    skipped for that key -- they are the low-information keys (a very common
+    prefix), they would dominate the runtime, and the other keys still cover
+    those records.
+    """
+    mats = _fit_views(s1, s23)          # fitted once, so cosines stay comparable
+    dfn = _doc_freq(s1["name_core"].to_numpy(), s23["name_core"].to_numpy())
+    dfa = _doc_freq(s1["addr_n"].to_numpy(), s23["addr_n"].to_numpy())
+    k1, k23 = blocking_keys(s1, dfn, dfa), blocking_keys(s23, dfn, dfa)
+    seen, skipped, blocks = [], 0, 0
+    for name in k1:
+        ga = _group_positions(*k1[name])
+        gb = _group_positions(*k23[name])
+        for key, pa in ga.items():
+            pb = gb.get(key)
+            if pb is None or pb.size > max_block:
+                skipped += pb is not None
+                continue
+            blocks += 1
+            for _, (A, B, k) in mats.items():
+                r, c = _topk_sparse(A[pa], B[pb], k)
+                if r.size:
+                    seen.append(np.stack([pa[r], pb[c]], axis=1))
+    if not seen:
+        return pd.DataFrame(columns=["s1_id", "cand_id", "cos_name", "cos_full", "cos_addr"])
+    pairs = np.unique(np.concatenate(seen), axis=0)   # same pair from several keys -> once
+    cand = _finish(s1, s23, mats, pairs[:, 0], pairs[:, 1])
+    n_before = len(cand)
+    cand = _cap_per_entity(cand, MAX_CANDS)
+    print(f"    [blocking] {blocks} blocks matched, {skipped} oversized skipped "
+          f"(> {max_block}), {n_before} pairs -> {len(cand)} after cap", flush=True)
+    return cand
+
+
+def _cap_per_entity(cand: pd.DataFrame, max_cands: int) -> pd.DataFrame:
+    """Keep the best `max_cands` candidates per S1 entity, ranked by the
+    strongest of the three cosine views. Ranking on the max rather than on one
+    view avoids discarding a candidate that only the address view liked, which
+    is exactly the renamed-business case the address view exists to catch."""
+    if max_cands <= 0 or cand.empty:
+        return cand
+    score = cand[["cos_name", "cos_full", "cos_addr"]].max(axis=1)
+    keep = score.groupby(cand["s1_id"]).rank(ascending=False, method="first") <= max_cands
+    return cand[keep].reset_index(drop=True)
+
+
+def generate_candidates(s1: pd.DataFrame, s23: pd.DataFrame, by_country: bool = True,
+                        multikey: bool = MULTIKEY) -> pd.DataFrame:
     """Run blocking for a whole split. s1/s23 must already have normalised columns."""
+    block = _block_by_keys if multikey else _block_group
     if not by_country:
-        return _block_group(s1, s23)
+        return block(s1, s23)
     out = []
     s23_countries = set(s23["country_n"])
     for c, s1g in s1.groupby("country_n"):
         s23g = s23[s23["country_n"] == c] if c in s23_countries else s23
         if len(s23g) == 0:
             s23g = s23
-        out.append(_block_group(s1g, s23g))
+        out.append(block(s1g, s23g))
     return pd.concat(out, ignore_index=True)
 
 
