@@ -168,3 +168,12 @@ Rules: never spend an upload on a threshold or hyperparameter nudge.
 An early version using only exact keys (no rare tokens) scored recall 0.8785 / cover 0.7395 at 2k — exact whole-name keys are too brittle for this noise, which is why rare-token indexing is the core of the design.
 
 `MAX_CANDS` set to 80: at 40 it cost 0.034 entity cover for 37% fewer pairs, which is a bad trade now that blocking cost is linear.
+
+### #9 — process-parallel blocking (`--block-workers N`), opt-in
+
+`run_pipeline.py --block-workers N` runs one PROCESS per country group (spawn; threads segfault rapidfuzz). Each worker reads its country slice straight from the normalisation cache and writes its own `pairs_{tag}_{c}.parquet`, so nothing large is pickled; the parent frees `s1/s23` during the parallel window and reloads from cache after. `N=1` (default) is the untouched serial path. Worker count is capped by group count AND free RAM (`_plan_block_workers`, `BLOCK_WORKER_GB=3.5` estimate) and falls back to serial when RAM is tight.
+
+- **Correctness: VERIFIED.** On the 2000-entity sample, parallel output is position-identical to serial — both country parquets identical across all 16 columns (global `ia/ib`, cosines, context features, `y`, `fold`); `total_pairs`/`pair_recall_ceiling`/`entity_full_cover` match exactly (37,904 / 0.9788 / 0.9435, reproducing the B2 2k row).
+- **Per-worker RAM at full scale: NOT MEASURED** (deferred: the full CV run held the machine, ≤6 GB free). Verify with external `Get-Process python` on the first real run before trusting it. Sample-scale worker peak was ~0.2 GB.
+- Fixed a latent ctypes handle bug so `_profile`'s `[mem]` lines (previously always `0.00 GB`) and the per-worker RSS report now read true values.
+- Expected wall-clock gain is bounded by group count and skew: train has 2 groups (US ≫ India) so < 2×; test has 3 (US/India/France).
