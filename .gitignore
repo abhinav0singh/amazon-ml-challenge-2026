@@ -10,6 +10,7 @@ env/
 # folds are meant to be shared, so commit that single file with:
 #     git add -f work/folds.csv
 work/
+work_*/
 output/
 output_*/
 
