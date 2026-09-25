@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from rapidfuzz import fuzz
+from rapidfuzz import fuzz, process
 from rapidfuzz.distance import JaroWinkler
 
 FEATURES = [
@@ -51,31 +51,102 @@ def build_pair_features(cand: pd.DataFrame, s1: pd.DataFrame, s23: pd.DataFrame)
         "nm_ratio", "nm_tsort", "nm_tset", "nm_partial", "nm_jw", "core_ratio", "core_tset",
         "core_jw", "core_first_tok_eq", "core_len_diff", "ad_ratio", "ad_tset", "ad_partial",
         "postal_match", "num_jacc", "num_overlap"]}
-    for i in range(n):
-        x, y = an[i], bn[i]
-        cols["nm_ratio"][i] = fuzz.ratio(x, y)
-        cols["nm_tsort"][i] = fuzz.token_sort_ratio(x, y)
-        cols["nm_tset"][i] = fuzz.token_set_ratio(x, y)
-        cols["nm_partial"][i] = fuzz.partial_ratio(x, y)
-        cols["nm_jw"][i] = JaroWinkler.similarity(x, y)
-        x, y = ac[i], bc[i]
-        cols["core_ratio"][i] = fuzz.ratio(x, y)
-        cols["core_tset"][i] = fuzz.token_set_ratio(x, y)
-        cols["core_jw"][i] = JaroWinkler.similarity(x, y)
-        xs, ys = x.split(), y.split()
-        cols["core_first_tok_eq"][i] = float(bool(xs) and bool(ys) and xs[0] == ys[0])
-        cols["core_len_diff"][i] = abs(len(x) - len(y))
-        x, y = aa[i], ba[i]
-        if x and y:
-            cols["ad_ratio"][i] = fuzz.ratio(x, y)
-            cols["ad_tset"][i] = fuzz.token_set_ratio(x, y)
-            cols["ad_partial"][i] = fuzz.partial_ratio(x, y)
-        else:  # one address missing: say "unknown" rather than "different"
-            cols["ad_ratio"][i] = cols["ad_tset"][i] = cols["ad_partial"][i] = -1
-        pa, pb = ap[i], bp[i]
-        cols["postal_match"][i] = -1.0 if not (pa and pb) else float(bool(pa & pb))
-        cols["num_jacc"][i] = _jacc(au[i], bu[i])
-        cols["num_overlap"][i] = len(au[i] & bu[i])
+# Vectorized fuzzy similarities
+    cols["nm_ratio"] = process.cpdist(
+        an, bn, scorer=fuzz.ratio, dtype=np.float32
+    )
+    cols["nm_tsort"] = process.cpdist(
+        an, bn, scorer=fuzz.token_sort_ratio, dtype=np.float32
+    )
+    cols["nm_tset"] = process.cpdist(
+        an, bn, scorer=fuzz.token_set_ratio, dtype=np.float32
+    )
+    cols["nm_partial"] = process.cpdist(
+        an, bn, scorer=fuzz.partial_ratio, dtype=np.float32
+    )
+    cols["nm_jw"] = process.cpdist(
+        an, bn, scorer=JaroWinkler.similarity, dtype=np.float32
+    )
+
+    cols["core_ratio"] = process.cpdist(
+        ac, bc, scorer=fuzz.ratio, dtype=np.float32
+    )
+    cols["core_tset"] = process.cpdist(
+        ac, bc, scorer=fuzz.token_set_ratio, dtype=np.float32
+    )
+    cols["core_jw"] = process.cpdist(
+        ac, bc, scorer=JaroWinkler.similarity, dtype=np.float32
+    )
+
+    # Cheap core-name features
+    cols["core_first_tok_eq"] = np.fromiter(
+        (
+            float(bool(x) and bool(y) and x.split()[0] == y.split()[0])
+            for x, y in zip(ac, bc)
+        ),
+        dtype=np.float32,
+        count=n,
+    )
+
+    cols["core_len_diff"] = np.fromiter(
+        (abs(len(x) - len(y)) for x, y in zip(ac, bc)),
+        dtype=np.float32,
+        count=n,
+    )
+
+    # Address similarities
+    valid_addr = np.fromiter(
+        (bool(x) and bool(y) for x, y in zip(aa, ba)),
+        dtype=bool,
+        count=n,
+    )
+
+    cols["ad_ratio"].fill(-1)
+    cols["ad_tset"].fill(-1)
+    cols["ad_partial"].fill(-1)
+
+    if valid_addr.any():
+        cols["ad_ratio"][valid_addr] = process.cpdist(
+            aa[valid_addr],
+            ba[valid_addr],
+            scorer=fuzz.ratio,
+            dtype=np.float32,
+        )
+        cols["ad_tset"][valid_addr] = process.cpdist(
+            aa[valid_addr],
+            ba[valid_addr],
+            scorer=fuzz.token_set_ratio,
+            dtype=np.float32,
+        )
+        cols["ad_partial"][valid_addr] = process.cpdist(
+            aa[valid_addr],
+            ba[valid_addr],
+            scorer=fuzz.partial_ratio,
+            dtype=np.float32,
+        )
+
+    # Postal agreement
+    cols["postal_match"] = np.fromiter(
+        (
+            -1.0 if not (pa and pb) else float(bool(pa & pb))
+            for pa, pb in zip(ap, bp)
+        ),
+        dtype=np.float32,
+        count=n,
+    )
+
+    # Number-set features
+    cols["num_jacc"] = np.fromiter(
+        (_jacc(x, y) for x, y in zip(au, bu)),
+        dtype=np.float32,
+        count=n,
+    )
+
+    cols["num_overlap"] = np.fromiter(
+        (len(x & y) for x, y in zip(au, bu)),
+        dtype=np.float32,
+        count=n,
+    )
     for k, v in cols.items():
         df[k] = v
 
