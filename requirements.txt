@@ -1,3 +1,4 @@
+
 # Pinned for reproducibility. Target interpreter: PYTHON 3.12.
 # These versions do not build on Python 3.13/3.14 — use 3.12.
 #
@@ -20,3 +21,23 @@ rapidfuzz==3.9.6         # MIT          — string-similarity features (pair_fea
 
 # Caches
 pyarrow==16.1.0          # Apache-2.0   — parquet for the OOF and test pair frames
+
+# Optional but likely needed
+optuna==3.6.1            # only for LATE-stage tuning, not early — see ml_engineer_prompt.md
+imbalanced-learn==0.12.3 # if target is imbalanced (StratifiedKFold territory)
+
+# NLP — optional embeddings for blocking/France (MIT/Apache model ≤ 8B only)
+# sentence-transformers==3.0.1
+# torch==2.3.1
+
+# EDA / utility
+matplotlib==3.9.0
+seaborn==0.13.2
+jupyter==1.0.0
+ipykernel==6.29.4
+
+# AWS SDKs removed from the core env: not needed to reproduce the pipeline,
+# and the rules forbid external lookup services. Install separately if using SageMaker compute.
+
+# Testing
+pytest==9.1.1

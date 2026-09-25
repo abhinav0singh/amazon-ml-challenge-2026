@@ -39,7 +39,6 @@ ADDR_MAP = {
     "ste": "suite", "apt": "apartment", "fl": "floor", "flr": "floor",
     "nr": "near", "opp": "opposite", "mkt": "market", "ngr": "nagar", "clny": "colony",
     "sec": "sector", "ph": "phase", "no": "number", "chs": "chemin", "rte": "route",
-    "n": "north", "s": "south", "e": "east", "w": "west",
     "ne": "northeast", "nw": "northwest", "se": "southeast", "sw": "southwest",
 }
 
