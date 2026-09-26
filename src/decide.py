@@ -52,7 +52,7 @@ def apply_rule(pairs: pd.DataFrame, t: float, one_to_one: bool) -> dict:
     df = pairs[pairs["p"] >= t]
     if one_to_one and len(df):
         df = df.sort_values("p", ascending=False).drop_duplicates("cand_id")
-    return df.groupby("s1_id")["cand_id"].agg(set).to_dict()
+    return _as_sets(df)
 
 
 def tune(pairs: pd.DataFrame, truth: dict, s1_ids, one_to_one: bool, grid=None):
@@ -98,10 +98,25 @@ def _award_to_best_s1(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _as_sets(df: pd.DataFrame) -> dict:
-    """{s1_id: set(cand_id)} from a frame of surviving pairs."""
+    """{s1_id: set(cand_id)} from a frame of surviving pairs.
+
+    Built from integer codes with one stable sort, not groupby().agg(set): on the
+    full-scale OOF frame (~9M pairs, 2.2M entities, categorical ids) the group-by
+    took ~86 s per call, and the CV stage makes ~200 calls -- ~5 h (measured
+    26 Sep). This takes seconds. Same sets; the only difference is that entities
+    with no surviving pair get no key instead of an empty set (a categorical
+    group-by with observed=False emitted those), which every consumer already
+    reads as an empty prediction via .get(s, set()).
+    """
     if not len(df):
         return {}
-    return df.groupby("s1_id")["cand_id"].agg(set).to_dict()
+    codes, uniq = pd.factorize(df["s1_id"].astype(object).to_numpy())
+    cands = df["cand_id"].astype(object).to_numpy()
+    order = np.argsort(codes, kind="stable")
+    cs, cands = codes[order], cands[order]
+    starts = np.flatnonzero(np.r_[True, cs[1:] != cs[:-1]])
+    ends = np.r_[starts[1:], len(cs)]
+    return {uniq[cs[a]]: set(cands[a:b].tolist()) for a, b in zip(starts, ends)}
 
 
 def apply_expected_f05(pairs: pd.DataFrame, floor: float = 0.0,
