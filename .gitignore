@@ -16,3 +16,6 @@ output_*/
 
 # Large intermediates
 *.parquet
+
+# Run handoff bundles (scripts/make_handoff.py) -- multi-GB zips, never commit
+handoff/
