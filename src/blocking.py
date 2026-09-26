@@ -79,7 +79,7 @@ MAX_BLOCK = 20000
 # per S1 on India, so the cap binds again: India oracle 0.9864 at cap 100, 0.9893
 # at 150, 0.9900 uncapped. 100 is the compute-affordable default (~1.4x v1's
 # candidates); 150 (~2x) only on a machine with >= 32 cores.
-MAX_CANDS = 100
+MAX_CANDS = 150
 CAP_SCORE = ("cos_full", "cos_addr")
 
 
