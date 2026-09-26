@@ -90,6 +90,25 @@ Recall ceiling = share of true pairs that survive blocking. Target ≥ 0.98 with
 |---|---|---|---|---|---|---|
 | E0 | P1 | Empty predictions (all singletons) | = train singleton share | | | baseline |
 | E1 | P1 | `run_pipeline.py` baseline (3-view TF-IDF blocking, 28 features, LGBM, t on OOF, one-to-one) | | | | |
+| E2 | P4 | **V1** · per-entity set selection by approximate expected F0.5, k = 0 allowed (`decide.apply_expected_f05`) | **not measured** — no full run. *Sample 20k:* 0.9843 vs baseline 0.9840 | *Sample:* held-out India 0.9637, US 0.9917 (baseline 0.9635 / 0.9916) | *Sample LOCO-India:* 0.988 / 0.931 | **inconclusive** |
+| E3 | P4 | **V2** · relative rule — keep p ≥ α × the entity's own max p, above an absolute floor t (`decide.apply_relative_rule`) | **not measured** — no full run. *Sample 20k:* 0.9840 vs baseline 0.9840 | *Sample:* held-out India 0.9642, US 0.9913 | *Sample LOCO-India:* 0.989 / 0.929 | **inconclusive** |
+
+**E2 / E3 notes (issue #3, P4).** Measured with `scripts/decide_eval.py` on a **20,000-entity sample**
+— development numbers only, never CV (AGENTS.md §4). Baseline sample cross-fitted score across model
+seeds 42/43/44: 0.9840 / 0.9843 / 0.9839 → **seed noise sd = 0.00021**, so the acceptance bar is a
+gain above **0.00042**. V1 gained **+0.00029** and improved 4 of 5 folds, but the gain is under the
+bar and its sign flips at seed 43; V2 gained **−0.00006** on 3 of 5 folds. Neither hurts LOCO.
+Both are therefore logged `inconclusive` and left in the code, unused by the pipeline, for re-testing
+at full scale once issues #1 and #2 land — the harness and its caches are committed, so the re-run is
+cheap.
+
+Two supporting measurements from the same run:
+- **Contested share** (records wanted by more than one S1 entity above the threshold): **0.50 %** at
+  t = 0.2, falling to **0.17 %** at t = 0.7 — well under 1 %, so a smarter conflict rule than
+  "highest probability wins" has almost nothing to act on. Not implemented.
+- **The decision layer is not where the score is** on this sample: pair precision 0.994 / recall
+  0.972 against a blocking entity-full-cover of 0.9545. The binding constraint is candidate
+  generation, not thresholding.
 
 ---
 

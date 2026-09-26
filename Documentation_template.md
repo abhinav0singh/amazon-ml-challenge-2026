@@ -141,6 +141,18 @@ are committed to git rather than merely deterministic, so a numpy or platform di
 silently change them. Dependencies are pinned in `requirements.txt` against **Python 3.12**. The end
 to end command is in `code/business_entity_resolution/README.md`.
 
+**One known gap, measured rather than assumed.** Candidate generation is *not* bit-reproducible
+across processes. `blocking._rare_tokens` selects a record's three rarest tokens with
+`sorted(set(tokens), key=lambda x: doc_freq.get(x, 0))[:3]`. `sorted` is stable, so ties on document
+frequency are broken by the iteration order of a *set of strings*, which depends on Python's
+per-process string-hash randomisation. Ties are common because most tokens share a low document
+frequency. Measured on a 20,000-entity sample: two runs of the same command on the same data
+produced candidate sets differing by **0.16 %** of pairs (1,581 / 997,187 present in only one of
+them). The fix is a deterministic tie-break — `key=lambda x: (doc_freq.get(x, 0), x)` — or setting
+`PYTHONHASHSEED`. Until that lands, treat scores below the third decimal as run-dependent, and note
+that a reviewer re-running the pipeline will get a `candidate_pairs.tsv` very close to, but not
+byte-identical to, the submitted one.
+
 ---
 
 ## 2. Candidate generation / blocking strategy
@@ -521,6 +533,9 @@ must be recorded **before** it is used, and it must be MIT or Apache-2.0 and at 
 7. **A single global threshold may be the wrong shape.** An entity with forty candidates faces more
    chances to err than one with two, so the best threshold may depend on candidate count. This is
    under investigation; nothing is measured yet.
+8. **Candidate generation is not bit-reproducible across processes** — see §1.4. The effect is
+   0.16 % of pairs on a sampled run, small but not zero, and it puts a floor under how small a score
+   difference we can honestly call real.
 
 ### 4.6 What we deliberately did not do
 
