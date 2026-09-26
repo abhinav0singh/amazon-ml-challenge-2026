@@ -14,7 +14,7 @@ WORKERS="${2:-3}"
 cd "$(dirname "$0")/.."
 PY=.venv/bin/python
 
-fail() { echo "FAILED: $1. Do NOT improvise -- send work/final_run.log to Abhinav." >&2; exit 1; }
+fail() { echo "FAILED: $1. Do NOT improvise -- send Abhinav this terminal's output, plus work/final_run.log if it exists." >&2; exit 1; }
 
 [ -f "$DATA/train/train_source1.tsv" ] && [ -f "$DATA/test/test_source1.tsv" ] \
     || fail "wrong data folder: '$DATA' must contain train/ and test/"

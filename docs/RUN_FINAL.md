@@ -29,13 +29,17 @@ Keep the data private to the VM, and delete the VM afterwards.
    (e.g. `D:\amlc\` or `~/amlc/`). You need the folder that contains `train/` and `test/`,
    e.g. `D:\amlc\student_resource\dataset`. Keep `utils/` next to `dataset/` — the run uses
    the organisers' validator from there.
-2. Get the code at the exact release tag (not whatever `main` is later):
+2. Get the code at the exact release tag (not whatever `main` is later), into a
+   **short path** such as `C:\amlc\repo` (Windows) or `~/amlc/repo` (Linux):
    ```
-   git clone https://github.com/abhinav0singh/amazon-ml-challenge-2026.git
-   cd amazon-ml-challenge-2026
+   git clone https://github.com/abhinav0singh/amazon-ml-challenge-2026.git C:\amlc\repo
+   cd C:\amlc\repo
    git checkout run-final-v1
    ```
-   Do not clone into OneDrive either.
+   Not inside OneDrive, and **not deep inside nested folders**: on Windows, pip fails to
+   install numpy when the full path passes 260 characters, with
+   `ERROR: Could not install packages due to an OSError: [Errno 2] No such file or directory: ...\.venv\...\libopenblas...dll`.
+   If you see that: delete the `.venv` folder, move the clone to a short path, run again.
 
 ## 3. Run it
 

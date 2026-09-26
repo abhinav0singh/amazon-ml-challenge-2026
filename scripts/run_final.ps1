@@ -20,7 +20,7 @@ $py = Join-Path $repo ".venv\Scripts\python.exe"
 
 function Check($what) {
     if ($LASTEXITCODE -ne 0) {
-        Write-Host "FAILED: $what (exit code $LASTEXITCODE). Do NOT improvise -- send work\final_run.log to Abhinav." -ForegroundColor Red
+        Write-Host "FAILED: $what (exit code $LASTEXITCODE). Do NOT improvise -- send Abhinav a copy of this window's output, plus work\final_run.log if it exists. (pip OSError / 'No such file' on a .dll = path too long: move the clone to a short path like C:\amlc\repo, delete .venv, rerun.)" -ForegroundColor Red
         exit 1
     }
 }

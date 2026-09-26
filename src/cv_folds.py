@@ -21,15 +21,22 @@ N_SPLITS = 5
 
 
 def make_s1_folds(s1_ids, path: str = "work/folds.csv", n_splits: int = N_SPLITS, seed: int = RANDOM_SEED) -> dict:
-    """Return {s1_id: fold}. If `path` exists it is LOADED (never silently
-    regenerated), so every teammate gets identical folds."""
+    """Return {s1_id: fold} for exactly the given `s1_ids`. If `path` exists it
+    is LOADED (never silently regenerated), so every teammate gets identical folds.
+
+    Only the requested ids are returned, each with its locked fold. Returning the
+    whole file was a bug: the CV code iterates over this dict's keys, so a run on a
+    subset of entities (e.g. a mini dry-run dataset next to the committed full
+    folds.csv) scored ~441k absent ids per fold as perfect "singletons" and
+    reported a cross-fitted CV of 1.0000. A full run is unaffected -- its ids are
+    exactly the file's."""
     if os.path.exists(path):
         f = pd.read_csv(path, dtype={"s1_id": str})
         folds = dict(zip(f["s1_id"], f["fold"]))
         missing = set(s1_ids) - set(folds)
         if missing:
             raise ValueError(f"{len(missing)} S1 ids missing from {path}; delete it only with team agreement")
-        return folds
+        return {s: int(folds[s]) for s in s1_ids}
     ids = np.array(sorted(s1_ids))
     rng = np.random.default_rng(seed)
     rng.shuffle(ids)

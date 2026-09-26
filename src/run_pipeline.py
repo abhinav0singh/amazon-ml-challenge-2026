@@ -1087,6 +1087,9 @@ def main():
     with open(folds_path, "rb") as f:
         folds_hash = hashlib.sha256(f.read()).hexdigest()[:16]
     report["folds_sha256_16"] = folds_hash
+    if len(s1_fold) != len(s1_ids):
+        raise AssertionError(f"folds cover {len(s1_fold)} ids, the run has {len(s1_ids)}")
+    log(f"folds: {len(s1_fold):,} S1 entities from {folds_path} (sha256 {folds_hash})")
 
     log("blocking train")
     tag = f"train{sfx}"
