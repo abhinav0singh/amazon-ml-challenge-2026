@@ -1,0 +1,6 @@
+# Shell scripts must keep LF endings on every checkout, including Windows ones
+# (core.autocrlf=true would otherwise give them CRLF, and bash on a Linux VM then
+# fails with "$'\r': command not found" at the first line of run_final.sh).
+*.sh    text eol=lf
+# PowerShell 5.1 is happiest with CRLF.
+*.ps1   text eol=crlf

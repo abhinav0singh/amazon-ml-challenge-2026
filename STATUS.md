@@ -81,7 +81,33 @@ Two measured recall leaks, both actionable (#9 task 2):
 1. **`MAX_CANDS=40` is binding** (avg kept 39.64 ≈ the cap). At 40k, cap 40 cost cover 0.955→0.921 vs cap 80; at full scale the haystack pushes more true matches past 40. NB the code value is 40 while the comment above it argues for 80 — a discrepancy to resolve. Raising the cap costs candidates (≈2×) → memory + feature-time, so it must be paired with the feature-stage fix below.
 2. **Oversized blocks skipped:** 184 (US) + 69 (India) blocks exceeded `MAX_BLOCK=20000` and were dropped for that key; some true pairs live only there. `n_tok` / `MAX_BLOCK` are the levers.
 
-**Separately, the feature stage — not blocking — dominates wall-clock:** assembling the 20M-pair training sample took ~6.5 h (00:34→07:04), single-threaded (rapidfuzz + Python postal/number loops). The OOF pass repeats this over all 87.5M pairs. Parallelising `pair_features` across PROCESSES (rapidfuzz threads segfault, same as blocking) is now the highest-leverage speedup for getting a CV at all.
+### ROOT CAUSE FOUND (26 Sep, full-haystack diagnostic) — the cap's ranking rule
+
+`scripts/diag_blocking_recall.py` measures recall with a **subset of S1 against the FULL S2/S3 haystack**, so block sizes and cap competition are real (samples shrink the haystack, which is why every sampled number was optimistic). India, 10,000 S1 vs all 4,133,346 India S2/S3:
+
+| rank the cap by | cap 40 | cap 60 | cap 80 | no cap |
+|---|---|---|---|---|
+| `max` of 3 cosines (**old**) | 0.823 / 0.656 | 0.926 / 0.815 | 0.941 / 0.847 | **0.943 / 0.853** |
+| `cos_full + cos_addr` (**new**) | 0.934 / 0.829 | 0.942 / 0.848 | **0.943 / 0.852** | |
+
+(pair recall / entity full cover).
+
+**US confirms it** (10,000 S1 vs all 6,186,873 US S2/S3), now with the **oracle macro-F0.5** — the score a *perfect* matcher would get on the candidate set, i.e. the ceiling blocking puts on the metric itself:
+
+| US | recall | cover | oracle F0.5 |
+|---|---|---|---|
+| `max` rank, cap 40 (**old**) | 0.929 | 0.836 | 0.9713 |
+| `cos_full + cos_addr`, cap 60 | 0.984 | 0.952 | 0.9947 |
+| `cos_full + cos_addr`, cap 80 (**new**) | **0.985** | **0.955** | **0.9952** |
+| no cap (ceiling) | 0.985 | 0.956 | 0.9953 |
+| + 3rd address rare token, cap 80 | 0.987 | 0.959 | 0.9961 (+0.0009, for +19% pre-cap pairs) |
+| + 4th name rare token | — | — | no gain |
+
+On US the old cap alone cost **0.024 of the achievable score**. Decision: `cos_full + cos_addr`, cap 80, token counts unchanged (the 3rd address token is a candidate for a later run, not worth +19% blocking cost now). US fit time 43 min on a busy laptop. India's ceiling (cover 0.853) is well below US's (0.956) — India is where remaining recall lives.
+
+Chain branches all score `cos_name = 1.0`, so a max-rank ties them and the cap kept an **arbitrary** 40 — discarding the true branch, which differs only by address. **Fix: rank by `cos_full + cos_addr`, cap 80** → +0.12 recall, +0.20 cover on India, reaching the no-cap ceiling. Doubling per-block K (+0.007 ceiling, 2× candidates) and matching the oversized blocks (+0.004) are not worth their cost. Scheme value: address rare tokens are the workhorse (recall alone 0.839, 6,451 true pairs no other key finds); postal is ~0 in India (0.3% of records have a code). The fit alone takes 19 min for India.
+
+**CORRECTION (26 Sep, measured):** the ~6.5 h spent assembling the 20M-pair training sample on 25–26 Sep was **memory swapping, not CPU.** All 16 string features run at **55k pairs/s on one core** (1M pairs = 18 s; the slowest scorers are `ad_partial` 237k/s and `ad_tset` 348k/s), so 20M pairs is ~6 min of CPU. The 16 GB laptop had 0.8–3 GB free while it held the full frames plus a whole 52M-row group read at once. Fix (in `run_pipeline.py`): drop the raw text columns after normalisation, drop `full_n` after blocking, stream every pair parquet in 1M-row batches, preallocate the training matrix, and derive blocking recall stats from the labels instead of per-entity Python sets. The earlier line recommending parallel features is withdrawn — CPU was never the problem. A full run needs a machine with ≥ 32 GB RAM (see `docs/RUN_FINAL.md`).
 
 | Ver | Method | Sample | Recall ceiling | Entity cover | Avg cands / S1 | Runtime | Notes |
 |---|---|---|---|---|---|---|---|
@@ -105,7 +131,9 @@ Two measured recall leaks, both actionable (#9 task 2):
 | ID | Owner | Change | CV macro-F0.5 (mean ± sd) | LOCO US→IN / IN→US | Precision / Recall | Decision |
 |---|---|---|---|---|---|---|
 | E0 | P1 | Empty predictions (all singletons) | = train singleton share | | | baseline |
-| E1 | P1 | `run_pipeline.py` baseline (3-view TF-IDF blocking, 28 features, LGBM, t on OOF, one-to-one) | | | | |
+| E1 | P1 | `run_pipeline.py` baseline (3-view TF-IDF blocking, 28 features, LGBM, t on OOF, one-to-one) | not measured (25 Sep full run killed at training: swapping on 16 GB) | | | superseded by run-final-v1 |
+| E2 | P1 | Blocking cap ranked by `cos_full + cos_addr` (was `max` of 3 cosines), cap 40 → 80. Full-haystack diagnostic, 10k S1 per country vs the full group | **not CV** — blocking only. Oracle macro-F0.5 (perfect matcher on candidates), US: 0.9713 → **0.9952** | | recall/cover India 0.823/0.656 → 0.943/0.852; US 0.929/0.836 → 0.985/0.955 | **ADOPT** in run-final-v1 |
+| E3 | P1 | LightGBM `learning_rate` 0.1 vs 0.05, 3M real candidate pairs, fold 0 held out | **not CV** — pair-level: logloss 0.01615 vs 0.01602, AP 0.99357 vs 0.99367 | | rounds to early stop 859 vs 1702 | **ADOPT 0.1**: same quality within 0.0001 AP, half the trees (prediction time ∝ trees) |
 | E2 | P4 | **V1** · per-entity set selection by approximate expected F0.5, k = 0 allowed (`decide.apply_expected_f05`) | **not measured** — no full run. *Sample 20k:* 0.9843 vs baseline 0.9840 | *Sample:* held-out India 0.9637, US 0.9917 (baseline 0.9635 / 0.9916) | *Sample LOCO-India:* 0.988 / 0.931 | **inconclusive** |
 | E3 | P4 | **V2** · relative rule — keep p ≥ α × the entity's own max p, above an absolute floor t (`decide.apply_relative_rule`) | **not measured** — no full run. *Sample 20k:* 0.9840 vs baseline 0.9840 | *Sample:* held-out India 0.9642, US 0.9913 | *Sample LOCO-India:* 0.989 / 0.929 | **inconclusive** |
 
@@ -160,10 +188,10 @@ Rules: never spend an upload on a threshold or hyperparameter nudge.
 -
 
 **Candidate generation / blocking strategy** (include recall ceiling and reduction ratio from §4)
--
+- Multi-key blocking (5-char name prefix, postal+initial, 3 rarest name tokens, 2 rarest address tokens), 3-view TF-IDF top-k inside each block, union capped at 80 per S1 **ranked by `cos_full + cos_addr`**. The earlier `max`-of-cosines rank tied every chain branch at `cos_name = 1.0` and kept an arbitrary subset: full-haystack diagnostics showed it cost 0.12 recall / 0.20 cover on India and 0.024 oracle F0.5 on US (§4, E2). Sampled haystacks hid this entirely — measure recall against the full haystack.
 
 **Model architecture and feature engineering**
--
+- LightGBM binary matcher, 28 features (12 context/cosine + 16 string), `learning_rate` 0.1 chosen by measurement over 0.05 (E3: same AP within 0.0001, half the trees). Engineering: resumable signed stages, streamed pair frames, memory-slimmed frames — the 25 Sep run's 6.5 h "feature" stage was swapping, not CPU (55k pairs/s/core measured).
 
 **Decision layer (thresholds, conflict resolution, singleton handling)**
 -

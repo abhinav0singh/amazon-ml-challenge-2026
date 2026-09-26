@@ -128,6 +128,8 @@ py -3.12 -m venv .venv
        --candidate output\candidate_pairs.tsv --test-dir <DATA>\test --check-ids
 ```
 
+**The final full-scale run is `scripts/run_final.ps1` / `scripts/run_final.sh` at tag `run-final-v1` — procedure in `docs/RUN_FINAL.md`.** It needs a machine with **≥ 32 GB RAM** (a 16 GB laptop swaps for hours). The pipeline is **resumable**: each stage saves its outputs with a signature of the code, data and settings, and rerunning the same command reuses every stage whose signature still matches (`--fresh` recomputes everything). To exercise the full code path — output checks, official validator, handoff — without a big machine, build a real-format mini dataset with `scripts/make_mini_dataset.py` and run the pipeline on it (`--sample` skips those final checks).
+
 `<DATA>` is the folder holding `train/` and `test/` — keep it **outside OneDrive**. On P1's machine that is `C:\amlc\student_resource\dataset`, with the organisers' `utils\` and `Documentation_template.md` beside it in `C:\amlc\student_resource\`. Results land in `work/report.json`: blocking recall, CV, LOCO, prediction rates. Those numbers go into `STATUS.md`; do not retype them from memory.
 
 `--check-ids` makes the validator confirm every ID exists in the test set. It costs a few GB of RAM and some time. Run it before every upload anyway — it is cheaper than a wasted submission.
