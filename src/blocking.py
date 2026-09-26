@@ -73,8 +73,13 @@ MAX_BLOCK = 20000
 # at cap 80 0.9952, no cap 0.9953 -- the old cap alone cost 0.024 of the score.
 #
 # Before the cap the union holds ~77 (India) / ~83 (US) candidates per S1
-# (p90 104 / 112), so cap 80 keeps the no-cap ceiling while bounding the worst case.
-MAX_CANDS = 80
+# (p90 104 / 112), so cap 80 kept the no-cap ceiling under v1's keys.
+#
+# v2 (asymmetric address keys, ADDR_TOK_S1 below) raises pre-cap volume to ~204
+# per S1 on India, so the cap binds again: India oracle 0.9864 at cap 100, 0.9893
+# at 150, 0.9900 uncapped. 100 is the compute-affordable default (~1.4x v1's
+# candidates); 150 (~2x) only on a machine with >= 32 cores.
+MAX_CANDS = 100
 CAP_SCORE = ("cos_full", "cos_addr")
 
 
@@ -156,18 +161,44 @@ def _finish(s1g, s23g, mats, ia, ib, target_nnz=80_000_000):
     The chunk size is derived from the matrix's own density so it adapts rather
     than relying on a constant that happens to work today.
     """
-    n = len(ia)
     cand = pd.DataFrame({"s1_id": s1g["entity_id"].to_numpy()[ia],
                          "cand_id": s23g["entity_id"].to_numpy()[ib]})
+    for name, out in _cosines(mats, ia, ib, target_nnz).items():
+        cand[name] = out
+    return cand
+
+
+def _cosines(mats, ia, ib, target_nnz=80_000_000) -> dict:
+    """All three view cosines for aligned (ia, ib) position pairs, chunked by
+    density (see _finish for why the chunking is not optional)."""
+    n = len(ia)
+    out = {}
     for name, (A, B, _) in mats.items():
         per_row = max(A.nnz / max(A.shape[0], 1), 1.0)
         chunk = max(1, min(n, int(target_nnz / per_row)))
-        out = np.empty(n, dtype=np.float32)
+        v = np.empty(n, dtype=np.float32)
         for s in range(0, n, chunk):
             e = min(s + chunk, n)
-            out[s:e] = np.asarray(A[ia[s:e]].multiply(B[ib[s:e]]).sum(axis=1)).ravel()
-        cand[name] = out
-    return cand
+            v[s:e] = np.asarray(A[ia[s:e]].multiply(B[ib[s:e]]).sum(axis=1)).ravel()
+        out[name] = v
+    return out
+
+
+def _cap_positions(ia, ib, score, max_cands):
+    """Boolean mask keeping each entity's best `max_cands` pairs by `score`.
+
+    Works on integer positions, so the cap runs BEFORE any string frame exists.
+    Same rule as the old pandas rank(method="first") on a frame sorted by
+    (ia, ib): descending score within the entity, ties to the lower ib. Pre-cap
+    volume is ~2.6x v1 with asymmetric address keys (India 204 vs 77 per S1), and
+    the old path held entity-id strings plus a string group-by for all of it."""
+    order = np.lexsort((ib, -score.astype(np.float64), ia))
+    ia_s = ia[order]
+    start = np.r_[True, ia_s[1:] != ia_s[:-1]]
+    first = np.maximum.accumulate(np.where(start, np.arange(len(ia_s)), 0))
+    keep = np.zeros(len(ia), dtype=bool)
+    keep[order[(np.arange(len(ia_s)) - first) < max_cands]] = True
+    return keep
 
 
 def _block_group(s1g, s23g):
@@ -250,7 +281,43 @@ def _doc_freq(*series_list):
     return c
 
 
-def blocking_keys(df: pd.DataFrame, dfreq_name=None, dfreq_addr=None) -> dict:
+# Address rare-token counts, per SIDE. Measured on the full India haystack (26 Sep,
+# scripts/diag_blocking_combo.py): every true pair blocking missed shared at least
+# one token with its match, but the S2/S3 record typically has no name and a SHORT
+# address ("3 83 8 2 qutubullapur hyderabad telangana") while the S1 record has a
+# LONG one. Each side indexed its own 2 rarest address tokens, so the long S1
+# address picked exotic tokens ("eshwar", "villas") the short one never contains
+# and the two never shared a key -- even at cos_full 0.75. Indexing S1 (2.2M,
+# the small side) under many address tokens and S2/S3 (10M) under a few makes
+# them meet on the S2/S3 record's rare tokens without blowing up block sizes.
+#
+#   India oracle macro-F0.5, full haystack, rank cos_full+cos_addr:
+#                          pre-cap/S1  cap 100  cap 150  no cap
+#   v1 (2 / 2)                  77     0.9795   0.9795   0.9795
+#   asym 8 / 2  [this]         204     0.9864   0.9893   0.9900
+#   asym 8 / 3 + num bigrams   229     0.9864   0.9898   0.9913
+#   asym 12 / 4 + num bigrams  266     0.9854   0.9895   0.9913
+# At any affordable cap 8/2 is as good as the richer variants and cheapest.
+ADDR_TOK_S1 = 8
+ADDR_TOK_S23 = 2
+# Keys on consecutive digit-bearing address tokens ("3_83", "8_2", "2_601"):
+# house/plot numbers are what survives when the name is missing and the address
+# is reduced to numbers + city.
+NUM_BIGRAMS = False   # measured: +0.0013 ceiling uncapped, nothing at any affordable cap
+
+
+def _num_bigrams(series, prefix="nb:"):
+    """Keys on consecutive pairs of address tokens that contain a digit."""
+    rows, keys = [], []
+    for i, s in enumerate(series):
+        t = [x for x in s.split() if any(ch.isdigit() for ch in x)]
+        for a, b in sorted(set(zip(t, t[1:]))):   # sorted: reproducible key order
+            rows.append(i)
+            keys.append(f"{prefix}{a}_{b}")
+    return np.asarray(rows, dtype=np.int64), np.asarray(keys, dtype=object)
+
+
+def blocking_keys(df: pd.DataFrame, dfreq_name=None, dfreq_addr=None, side: str = "s23") -> dict:
     """Complementary blocking schemes, all derived from the record itself
     (no external data, no country branching). Each returns (rows, keys), and a
     record may appear under several keys of the same scheme.
@@ -272,7 +339,10 @@ def blocking_keys(df: pd.DataFrame, dfreq_name=None, dfreq_addr=None) -> dict:
     if dfreq_name is not None:
         out["nametok"] = _rare_tokens(df["name_core"].to_numpy(), dfreq_name, 3, "n:")
     if dfreq_addr is not None:
-        out["addrtok"] = _rare_tokens(df["addr_n"].to_numpy(), dfreq_addr, 2, "a:")
+        n_addr = ADDR_TOK_S1 if side == "s1" else ADDR_TOK_S23
+        out["addrtok"] = _rare_tokens(df["addr_n"].to_numpy(), dfreq_addr, n_addr, "a:")
+    if NUM_BIGRAMS:
+        out["numbig"] = _num_bigrams(df["addr_n"].to_numpy())
     return out
 
 
@@ -290,7 +360,7 @@ def _block_by_keys(s1: pd.DataFrame, s23: pd.DataFrame, max_block: int = MAX_BLO
     mats = _fit_views(s1, s23)          # fitted once, so cosines stay comparable
     dfn = _doc_freq(s1["name_core"].to_numpy(), s23["name_core"].to_numpy())
     dfa = _doc_freq(s1["addr_n"].to_numpy(), s23["addr_n"].to_numpy())
-    k1, k23 = blocking_keys(s1, dfn, dfa), blocking_keys(s23, dfn, dfa)
+    k1, k23 = blocking_keys(s1, dfn, dfa, "s1"), blocking_keys(s23, dfn, dfa, "s23")
     seen, skipped, blocks = [], 0, 0
     for name in k1:
         ga = _group_positions(*k1[name])
@@ -308,9 +378,17 @@ def _block_by_keys(s1: pd.DataFrame, s23: pd.DataFrame, max_block: int = MAX_BLO
     if not seen:
         return pd.DataFrame(columns=["s1_id", "cand_id", "cos_name", "cos_full", "cos_addr"])
     pairs = np.unique(np.concatenate(seen), axis=0)   # same pair from several keys -> once
-    cand = _finish(s1, s23, mats, pairs[:, 0], pairs[:, 1])
-    n_before = len(cand)
-    cand = _cap_per_entity(cand, MAX_CANDS)
+    del seen
+    ia, ib = pairs[:, 0].copy(), pairs[:, 1].copy()
+    del pairs
+    cos = _cosines(mats, ia, ib)
+    n_before = len(ia)
+    if MAX_CANDS > 0:
+        keep = _cap_positions(ia, ib, cos[CAP_SCORE[0]] + cos[CAP_SCORE[1]], MAX_CANDS)
+        ia, ib = ia[keep], ib[keep]
+        cos = {k: v[keep] for k, v in cos.items()}
+    cand = pd.DataFrame({"s1_id": s1["entity_id"].to_numpy()[ia],
+                         "cand_id": s23["entity_id"].to_numpy()[ib], **cos})
     print(f"    [blocking] {blocks} blocks matched, {skipped} oversized skipped "
           f"(> {max_block}), {n_before} pairs -> {len(cand)} after cap", flush=True)
     return cand

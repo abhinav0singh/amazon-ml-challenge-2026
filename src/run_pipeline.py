@@ -87,6 +87,10 @@ MAX_TRAIN_PAIRS = 20_000_000
 P_KEEP = 0.15
 PRED_CHUNK = 4_000_000
 
+# MEASURED 26 Sep on the v1 run (8 cores / 67 GB VM): worker peaks India 20.2 GB,
+# US 30.4 GB. v2's asymmetric keys make ~2.6x the pre-cap pairs; the cap now runs
+# on integer positions before any string frame (blocking._cap_positions), so the
+# estimate is ~35-40 GB for US -> 40 GB. A 64 GB VM blocks serially; 128 GB runs 2.
 # Per-worker resident memory for process-parallel blocking (--block-workers), used
 # only to cap the worker count so RAM is never oversubscribed. A worker holds one
 # country's slice of the normalisation cache, the three TF-IDF views for that group
@@ -97,7 +101,7 @@ PRED_CHUNK = 4_000_000
 # or three groups at once. The first parallel run logs each worker's true peak
 # RSS; replace this with that measurement. AMLC_BLOCK_WORKER_GB overrides it (only
 # for testing the parallel path on a small dataset -- never lower it for a full run).
-BLOCK_WORKER_GB = float(os.environ.get("AMLC_BLOCK_WORKER_GB", "16.0"))
+BLOCK_WORKER_GB = float(os.environ.get("AMLC_BLOCK_WORKER_GB", "40.0"))
 
 # Total RAM below which a full-scale run is expected to swap. The 25 Sep run on a
 # 16 GB laptop spent ~6.5 h assembling a 20M-pair training sample that takes minutes
