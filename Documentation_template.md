@@ -141,17 +141,20 @@ are committed to git rather than merely deterministic, so a numpy or platform di
 silently change them. Dependencies are pinned in `requirements.txt` against **Python 3.12**. The end
 to end command is in `code/business_entity_resolution/README.md`.
 
-**One known gap, measured rather than assumed.** Candidate generation is *not* bit-reproducible
-across processes. `blocking._rare_tokens` selects a record's three rarest tokens with
-`sorted(set(tokens), key=lambda x: doc_freq.get(x, 0))[:3]`. `sorted` is stable, so ties on document
-frequency are broken by the iteration order of a *set of strings*, which depends on Python's
-per-process string-hash randomisation. Ties are common because most tokens share a low document
-frequency. Measured on a 20,000-entity sample: two runs of the same command on the same data
-produced candidate sets differing by **0.16 %** of pairs (1,581 / 997,187 present in only one of
-them). The fix is a deterministic tie-break — `key=lambda x: (doc_freq.get(x, 0), x)` — or setting
-`PYTHONHASHSEED`. Until that lands, treat scores below the third decimal as run-dependent, and note
-that a reviewer re-running the pipeline will get a `candidate_pairs.tsv` very close to, but not
-byte-identical to, the submitted one.
+**One reproducibility defect was found and fixed, and it is worth recording because it was invisible
+to every test we had.** Candidate generation used not to be bit-reproducible across processes.
+`blocking._rare_tokens` selects a record's three rarest tokens with
+`sorted(set(tokens), key=...)`; `sorted` is stable, so ties on document frequency were broken by the
+iteration order of a *set of strings*, which depends on Python's per-process string-hash
+randomisation. Ties are the common case, not the rare one, because most tokens share a low document
+frequency. Measured on a 20,000-entity sample: two runs of the same command on the same data produced
+candidate sets differing by **0.16 %** of pairs (1,581 of 997,187 present in only one of them), and
+the same input under six values of `PYTHONHASHSEED` produced six different key sets.
+
+The fix is a deterministic tie-break, `key=lambda x: (doc_freq.get(x, 0), x)` — rarest first, then
+alphabetical — which is stable across processes and costs nothing. It is in the shipped code. A
+reviewer re-running the pipeline now gets the same candidate set we submitted. Figures in this
+document that were measured before the fix are flagged in §4.6.
 
 ---
 
@@ -219,10 +222,17 @@ Two caps bound the worst case:
 - `MAX_BLOCK = 20000` — a key whose Source 2/3 block exceeds this is skipped **for that key**. These
   are the low-information keys (a very common prefix); they would dominate runtime and the other keys
   still cover those records.
-- `MAX_CANDS = 80` — after the keys are unioned, each Source 1 entity keeps at most 80 candidates,
-  ranked by the **maximum** of the three cosines. Ranking on the maximum rather than on one view
-  avoids discarding a candidate that only the address view liked, which is exactly the
-  renamed-business case the address view exists to catch.
+- `MAX_CANDS = 80`, ranked by **`cos_full + cos_addr`** (`CAP_SCORE` in `blocking.py`) — after the
+  keys are unioned, each Source 1 entity keeps its best 80 candidates by that sum.
+
+  **Both the ranking rule and the cap value were changed after a full-scale measurement, and the
+  change is the single largest score improvement in this project.** The original rule ranked by the
+  *maximum* of the three cosines with a cap of 40. That looks reasonable and is badly wrong on this
+  data: a business with many branches produces candidates whose names are *identical*, so every
+  branch scores `cos_name = 1.0`. The maximum therefore ties across all of them, the tie is broken
+  arbitrarily, and the cap discards the one branch that is actually the right answer — which differs
+  from its siblings only in the address. Summing `cos_full + cos_addr` makes the address the
+  tie-breaker exactly where the name has stopped discriminating. §2.5 has the numbers.
 
 `candidate_pairs.tsv` is written from this final, capped candidate frame — it is the exact set the
 matcher runs inference over, as the problem statement requires.
@@ -233,11 +243,70 @@ rare-token indexing is the core of the design.
 
 ### 2.5 Measured blocking results
 
-> **All rows below are from deliberately sub-sampled runs** (`src/sweep_blocking.py` and
-> `run_pipeline.py --sample`). Sampling preserves the Source 2/3-records-per-Source 1-entity density
-> but shrinks the haystack, so these ceilings are **optimistic**. **No full-scale blocking run has
-> completed.** Full-scale recall ceiling, entity cover, candidates per entity, reduction ratio and
-> runtime are all **[TBD]**.
+#### Full scale — and why every sampled number above was misleading
+
+First full-scale train blocking, measured 26 Sep 00:34 (config: multi-key, `MAX_CANDS=40` ranked by
+`max`, 3 name / 2 address rare tokens, `MAX_BLOCK=20000`):
+
+| Split | Total pairs | Cands / S1 | **Pair recall ceiling** | **Entity full cover** | Wall-clock |
+|---|---|---|---|---|---|
+| train (US + India) | 87,483,735 | 39.64 | **0.8851** | **0.7665** | ~4.5 h |
+
+The 40,000-entity sample had projected **0.9833 / 0.9546**. The full-scale reality was
+**0.885 / 0.766** — 23 % of entities missing at least one true match, capping a *perfect* matcher
+far below the achievable band. **Sampling optimism was much larger than extrapolation from the
+sample sizes predicted**, which is the single most important methodological lesson of this project:
+a blocking ceiling measured on a shrunken haystack is not a forecast of the real one, because the
+haystack is precisely what makes blocking hard.
+
+#### Root cause, and the fix
+
+`scripts/diag_blocking_recall.py` measures recall for a *subset* of Source 1 entities against the
+**full** Source 2/3 haystack, so block sizes and cap competition are realistic while the run stays
+affordable. That diagnostic localised the loss to the cap's ranking rule, not to the keys.
+
+India — 10,000 Source 1 entities against all 4,133,346 India Source 2/3 records (pair recall / entity
+full cover):
+
+| Rank the cap by | cap 40 | cap 60 | cap 80 | no cap |
+|---|---|---|---|---|
+| `max` of the three cosines (old) | 0.823 / 0.656 | 0.926 / 0.815 | 0.941 / 0.847 | 0.943 / 0.853 |
+| **`cos_full + cos_addr` (new)** | 0.934 / 0.829 | 0.942 / 0.848 | **0.943 / 0.852** | — |
+
+US — 10,000 Source 1 entities against all 6,186,873 US records, with the **oracle macro-F0.5**: the
+score a *perfect* matcher would achieve on the candidate set, i.e. the ceiling blocking imposes on
+the metric itself.
+
+| US setting | Recall | Cover | Oracle F0.5 |
+|---|---|---|---|
+| `max` rank, cap 40 (old) | 0.929 | 0.836 | 0.9713 |
+| `cos_full + cos_addr`, cap 60 | 0.984 | 0.952 | 0.9947 |
+| **`cos_full + cos_addr`, cap 80 (adopted)** | **0.985** | **0.955** | **0.9952** |
+| no cap (ceiling) | 0.985 | 0.956 | 0.9953 |
+| + a 3rd address rare token, cap 80 | 0.987 | 0.959 | 0.9961 |
+
+**On US the old ranking rule alone cost 0.024 of the achievable score** — larger than any modelling
+change measured in this project. At cap 80 the new rule reaches the no-cap ceiling to within 0.0001
+of oracle F0.5, so the cap is no longer binding in any measurable way.
+
+A third address rare token buys a further +0.0009 oracle F0.5 for +19 % pre-cap pairs and was
+**deferred** as a poor trade against blocking cost; a fourth *name* rare token gave no gain at all.
+
+**Which keys earn their place** (India): address rare tokens are the workhorse — 0.839 recall on
+their own, and they are the only key that finds 6,451 true pairs. The postal key contributes
+approximately nothing in India, where only 0.3 % of records carry a code; it remains because it is
+decisive where a code *is* present and costs almost nothing.
+
+**Remaining recall lives in India.** Its cover ceiling (0.853) is far below US's (0.956), so India,
+not France, is where candidate generation is still weakest.
+
+#### Earlier sampled runs — kept for the record
+
+> **Every row below is from a deliberately sub-sampled run** (`src/sweep_blocking.py` and
+> `run_pipeline.py --sample`). Sampling preserves the Source 2/3-records-per-entity density but
+> shrinks the haystack. Compare them against the full-scale figures above to see how far optimistic
+> they are; they are reported here as the cost/ceiling measurements that drove the design, never as
+> estimates of real performance. Reduction ratio and full-run test-side figures remain **[TBD]**.
 
 **B1 — sparse top-k over a whole country group (rejected):**
 
@@ -505,7 +574,44 @@ reviewer sees that we identified it rather than overlooked it.
 No pretrained model is used. If one is ever added, its exact model id, licence and parameter count
 must be recorded **before** it is used, and it must be MIT or Apache-2.0 and at most 8 B parameters.
 
-### 4.5 Honest limitations
+### 4.5 Engineering: what it took to run at full scale
+
+Getting this pipeline through 2.2 M × 10.3 M records was a larger problem than any modelling
+decision, and the diagnosis is worth recording because the obvious answer was wrong.
+
+**The 6.5-hour stage that looked CPU-bound was memory swapping.** Assembling the ~20 M-pair training
+sample took about 6.5 hours on a 16 GB laptop, which invited the conclusion that feature computation
+needed parallelising. Measured on 26 Sep, that conclusion was **false**: all 16 string features run
+at **55,000 pairs/s on a single core** (1 M pairs in 18 s; the slowest scorers are `ad_partial` at
+237k/s and `ad_tset` at 348k/s), so 20 M pairs is roughly **6 minutes** of actual CPU. The machine
+had 0.8–3 GB free while holding the full frames plus a whole 52 M-row group read in one go. The time
+went to the page file, not the processor. **The earlier recommendation to parallelise the feature
+stage was withdrawn on this evidence.**
+
+The fixes were all about peak memory, in `run_pipeline.py`:
+
+- drop the raw text columns once normalisation has produced the derived ones;
+- drop `full_n` after blocking, which is the last stage that needs it;
+- stream every pair parquet in 1 M-row batches instead of reading a group whole;
+- preallocate the training matrix rather than growing it;
+- derive blocking recall statistics from the labels instead of building per-entity Python sets.
+
+**A full run needs ≥ 32 GB RAM** (64 GB recommended), 8+ cores and ~50 GB free disk. The run prints a
+loud warning below 30 GB. `docs/RUN_FINAL.md` is the runbook.
+
+**Resumability.** Each finished stage — blocking, models, out-of-fold prediction, CV, test blocking,
+test prediction — is saved with a signature of both the code and the data that produced it. Re-running
+the same command resumes from the last completed stage, losing at most the stage that was running, and
+a changed input or a changed source file invalidates the affected stage rather than silently reusing a
+stale cache. `--fresh` forces a full recompute. On a run measured in double-digit hours against a hard
+deadline, this is what makes a crash survivable rather than fatal.
+
+**Verification is part of the run, not a manual step afterwards.** The pipeline checks its own output
+and then shells out to the organisers' `validate_submission.py` with `--check-ids`, so a malformed
+submission is caught by the run that produced it. `scripts/make_handoff.py` refuses to build the
+handoff bundle at all unless the run finished and every check passed.
+
+### 4.6 Honest limitations
 
 1. **One-to-one resolves within a fold during CV, but across all entities at test time.** The
    assignment step in `decide.py` de-duplicates candidates within whatever frame it is given. In
@@ -514,9 +620,9 @@ must be recorded **before** it is used, and it must be MIT or Apache-2.0 and at 
    bias is small but real, and the CV number carries this approximation. We have deliberately **not**
    "fixed" it by scoring test-like competition into folds, because doing so would change the meaning
    of every CV number already recorded.
-2. **No full-scale run has completed.** Every CV, LOCO, precision, recall and runtime figure for the
-   full dataset is [TBD]. The blocking figures that do exist come from sub-sampled runs whose smaller
-   haystack makes both recall ceiling and precision optimistic.
+2. **No full-scale run of the whole pipeline has completed.** Full-scale *blocking* has now run and
+   is reported in §2.5, but every CV, LOCO, precision, recall and threshold figure for the full
+   dataset is still [TBD]. Nothing in this document reports a model score measured at full scale.
 3. **Early stopping uses the fold it is scored on.** Each fold model early-stops on the same held-out
    fold whose out-of-fold probabilities it produces. The number of boosting rounds is therefore
    mildly optimistic with respect to that fold. The effect on a 2,000-tree ceiling with 100-round
@@ -524,20 +630,30 @@ must be recorded **before** it is used, and it must be MIT or Apache-2.0 and at 
 4. **France has no direct measurement.** `--loco` between US and India is a proxy. France differs
    from both in language, address grammar and legal forms, and a US↔India transfer result may over-
    or under-state French performance in either direction.
-5. **The recall ceiling caps everything.** Entity full cover — the share of entities whose *entire*
-   true set survives blocking — was 0.9546 at the 40,000-entity sample. Any entity whose true set is
-   only partly covered cannot reach F0.5 = 1.0 no matter how good the matcher is.
-6. **Blocking cost at full scale is extrapolated, not measured.** The sub-linear cost exponent of
-   0.91 is measured across 2k → 40k; the projected full-scale runtime that follows from it is an
-   extrapolation and is marked as such wherever it appears.
+5. **The recall ceiling caps everything, and India is the weak country.** Entity full cover is the
+   share of entities whose *entire* true set survives blocking; an entity only partly covered cannot
+   reach F0.5 = 1.0 however good the matcher is. After the cap fix this is 0.955 on US but only
+   0.852 on India, so the largest remaining headroom in the whole system is India's candidate
+   generation — not the model, and not France.
+6. **The improved blocking configuration has not itself been re-run at full scale.** The
+   `cos_full + cos_addr` / cap-80 numbers in §2.5 come from the full-haystack diagnostic
+   (10,000 Source 1 entities against the complete Source 2/3 side), which makes block sizes and cap
+   competition realistic but is still not a whole-corpus run. The 0.8851 / 0.7665 figures are from the
+   full run of the *old* configuration.
 7. **A single global threshold may be the wrong shape.** An entity with forty candidates faces more
    chances to err than one with two, so the best threshold may depend on candidate count. This is
    under investigation; nothing is measured yet.
-8. **Candidate generation is not bit-reproducible across processes** — see §1.4. The effect is
-   0.16 % of pairs on a sampled run, small but not zero, and it puts a floor under how small a score
-   difference we can honestly call real.
+8. **Two changes that are in the shipped pipeline were never A/B-measured at full scale.** The
+   `n`/`s`/`e`/`w` → north/south/east/west address normalisation merged in PR #12 was adopted on
+   reasoning, not on a measured before/after at scale; and the learning rate was chosen, not tuned
+   against alternatives. Both are plausible and neither is validated, which is stated here rather
+   than implied by silence.
+9. **Early figures in this document were produced before the blocking determinism fix.** Candidate
+   generation used to depend on Python's per-process string-hash order (§1.4); any number in this
+   document measured before that fix carries roughly 0.16 % of run-to-run candidate churn beneath
+   it. The fix is in; the older measurements were not redone.
 
-### 4.6 What we deliberately did not do
+### 4.7 What we deliberately did not do
 
 - **No external data of any kind** — no geocoding, no business registries, no commercial
   entity-resolution services, no scraped or downloaded reference lists, no pretrained embedding

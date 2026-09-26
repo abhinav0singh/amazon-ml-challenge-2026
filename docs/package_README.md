@@ -19,6 +19,23 @@ artefact the pipeline itself wrote.
 
 ## 1. Requirements
 
+### Hardware — check this before starting
+
+| | Minimum | Recommended |
+|---|---|---|
+| RAM | **32 GB** | 64 GB |
+| CPU cores | 8 | 8–16 |
+| Free disk | 50 GB | 100 GB |
+
+**Do not attempt a full run on a 16 GB machine.** It does not fail — it swaps, and a stage that
+needs minutes of CPU takes hours. On 25 September a 16 GB laptop spent 6.5 hours on a step that is
+about 6 minutes of actual computation. The pipeline prints a loud warning below 30 GB.
+
+A full run takes roughly **17–19 hours** serially, or **11–12 hours** with parallel blocking on
+16 cores. See §3 for how to resume it if it stops.
+
+### Software
+
 **Python 3.12.** The pinned versions below do not build on Python 3.13 or 3.14; use 3.12.
 
 ```bash
@@ -121,9 +138,31 @@ What it does, in order:
 | `--work` | `work` | Scratch folder: `folds.csv`, `report.json`, parquet caches. |
 | `--loco` | off | Run the leave-one-country-out generalisation check. |
 | `--no-one-to-one` | off | Disable the one-record-to-one-entity assignment step. |
-| `--no-country-block` | off | Do not group by country before blocking. |
 | `--sample N` | `0` (off) | **Smoke test only.** Run on N Source 1 entities. Writes `folds_sampleN.csv` and `report_sampleN.json` instead of the locked artefacts, and skips the validator. Scores from a sampled run are optimistic and are not cross-validation. |
 | `--sample-seed` | `42` | Seed for `--sample`. |
+| `--skip-test` | off | Stop after cross-validation. Produces no submission files. |
+| `--block-workers N` | `1` (serial) | Blocking parallelism across country groups, using **processes** (threads segfault rapidfuzz). The count is capped by the number of groups and by free RAM. |
+| `--fresh` | off | Ignore saved stages and recompute everything. See §3.1 — you rarely want this. |
+| `--log FILE` | none | Append everything printed, including tracebacks, to this file as well. |
+
+### 3.1 If it stops, run exactly the same command again
+
+Each finished stage — blocking, models, out-of-fold prediction, CV, test blocking, test prediction —
+is saved together with a signature of the code and the data that produced it. Re-running the same
+command **resumes** from the last completed stage; you lose at most the stage that was in flight.
+
+This is deliberate and it is the difference between a crash costing minutes and costing a day:
+
+- **Do not delete `work/` between attempts.** That is where the resumable state lives.
+- **Do not pass `--fresh`** unless you actually intend to recompute everything from scratch. It
+  exists for the case where you want to be certain nothing is reused.
+- Editing a source file or changing the input data changes the signature, so the affected stages
+  recompute automatically. A stale cache cannot silently survive a code change.
+
+`work/folds.csv` — the locked 5-fold split — is committed to the repository and is read if present.
+If it is absent it regenerates deterministically from sorted entity ids and a fixed seed, so an
+independent machine reproduces the same folds. Do not delete it: every cross-validation number ever
+quoted by this project is tied to that file.
 
 ### A 3-minute smoke test first
 
@@ -153,7 +192,7 @@ entity. It is useful as a format check against the validator and the portal:
 | Path | Contents |
 |---|---|
 | `output/matching_results.tsv` | One row per test Source 1 entity: `source1_entity_id` TAB `matched_entity_ids`. The id list is comma-joined, de-duplicated and sorted; the field is empty for entities predicted to have no matches. **This is the file uploaded to the leaderboard.** |
-| `output/candidate_pairs.tsv` | One row per test Source 1 entity: `source1_entity_id` TAB `candidate_entity_ids`. The exact candidate set the matcher ran inference over, before thresholding. Every id in `matching_results.tsv` also appears here. |
+| `output/candidate_pairs.tsv` | One row per test Source 1 entity: `source1_entity_id` TAB `candidate_entity_ids`. The exact candidate set the matcher ran inference over, before thresholding. Every id in `matching_results.tsv` also appears here. **Approximately 1.5 GB uncompressed** at the shipped cap of 80 candidates per entity. |
 | `work/report.json` | Blocking recall ceiling, entity cover, candidates per entity, cross-fitted CV macro-F0.5, per-fold thresholds, LOCO scores and test prediction rates. |
 
 Both TSVs are written by hand with a literal tab separator, `\n` line endings, UTF-8 and no quoting,
