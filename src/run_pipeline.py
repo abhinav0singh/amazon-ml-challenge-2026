@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 import os
 import subprocess
@@ -46,6 +47,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from blocking import blocking_report, generate_candidates  # noqa: E402
@@ -55,12 +57,24 @@ from decide import apply_rule, check_one_to_one, cross_fitted_score, tune  # noq
 from metric import macro_f05, precision_recall  # noqa: E402
 from normalize import add_normalized_columns  # noqa: E402
 from pair_features import (CONTEXT_FEATURES, FEATURES, STRING_FEATURES,  # noqa: E402
-                           add_context_features, iter_string_features, prepare_side)
+                           add_context_features, prepare_side, string_features)
 
 SEED = 42
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", message=".*eval_set.*")
-LGB_PARAMS = dict(objective="binary", learning_rate=0.05, num_leaves=63, min_child_samples=50,
+# decide.apply_rule groups a categorical without observed=; pandas 2.2 warns that the
+# default will change. With the pinned pandas the result is unchanged (unobserved
+# entities get an empty set = an empty prediction), and the warning fires on every
+# threshold evaluation -- hundreds of lines that would bury the run log.
+warnings.filterwarnings("ignore", category=FutureWarning, message=".*observed=False.*")
+# learning_rate 0.1, not 0.05 -- MEASURED 26 Sep on 3M real candidate pairs (fold 0
+# held out): lr 0.1 stopped at 859 rounds, val logloss 0.01615, AP 0.99357; lr 0.05
+# stopped at 1702 rounds, logloss 0.01602, AP 0.99367. Same quality within 0.0001 AP,
+# half the trees -- and prediction cost is proportional to trees: the test side
+# averages 5 fold models over ~125M pairs, ~5 h at 2000 trees on 8 cores. At 16M
+# training rows lr 0.05 would likely hit the round cap. 2000 rounds leaves early
+# stopping in charge (2.3x what lr 0.1 needed at 2.4M rows).
+LGB_PARAMS = dict(objective="binary", learning_rate=0.1, num_leaves=63, min_child_samples=50,
                   feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1, lambda_l2=1.0,
                   n_estimators=2000, random_state=SEED, verbose=-1, n_jobs=-1)
 
@@ -73,13 +87,31 @@ MAX_TRAIN_PAIRS = 20_000_000
 P_KEEP = 0.15
 PRED_CHUNK = 4_000_000
 
-# Rough per-worker resident memory for process-parallel blocking (--block-workers).
-# Each worker loads ONE country's slice of the normalisation cache plus the TF-IDF
-# matrices for that group. This is an ESTIMATE used only to cap the worker count so
-# we never oversubscribe RAM; the first real run logs each worker's true peak RSS
-# (see _block_group_worker), and this number should be replaced with that measurement.
-# NOT MEASURED at full scale yet -- deliberately conservative.
-BLOCK_WORKER_GB = 3.5
+# Per-worker resident memory for process-parallel blocking (--block-workers), used
+# only to cap the worker count so RAM is never oversubscribed. A worker holds one
+# country's slice of the normalisation cache, the three TF-IDF views for that group
+# (the US full-haystack diagnostic held ~6-8 GB with only 10k S1), ~110M pre-cap
+# pairs for the US group, and the ~98M-row capped frame with context features.
+# Estimated ~15-17 GB for US at cap 80, so 16 GB: a 32 GB machine then blocks
+# SERIALLY (the proven path, ~21-23 GB peak) and only a ~64 GB machine runs two
+# or three groups at once. The first parallel run logs each worker's true peak
+# RSS; replace this with that measurement. AMLC_BLOCK_WORKER_GB overrides it (only
+# for testing the parallel path on a small dataset -- never lower it for a full run).
+BLOCK_WORKER_GB = float(os.environ.get("AMLC_BLOCK_WORKER_GB", "16.0"))
+
+# Total RAM below which a full-scale run is expected to swap. The 25 Sep run on a
+# 16 GB laptop spent ~6.5 h assembling a 20M-pair training sample that takes minutes
+# of CPU (measured: 55k pairs/s/core for all 16 string features) -- the machine was
+# paging. The pre-flight check warns loudly below this.
+MIN_RAM_GB = 30.0
+
+# Parquet row-group size for the spilled pair frames, so every later stage can
+# stream them in bounded batches instead of loading a 50M-row group at once.
+ROW_GROUP = 1_000_000
+
+# Columns only the normaliser needs. Dropping them after normalisation frees about
+# a third of the frame memory (~2.8 GB on train) -- measured: S1 1.55 GB -> ~1.05 GB.
+RAW_COLS = ["business_name", "business_address", "country"]
 
 
 def log(msg):
@@ -114,7 +146,12 @@ def _profile(stage):
         log(f"  [mem] after {stage}: now {c.WorkingSetSize/1e9:.2f} GB, "
             f"peak {c.PeakWorkingSetSize/1e9:.2f} GB")
     except Exception:
-        pass
+        try:                                    # Linux / cloud VMs
+            import resource
+            peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6
+            log(f"  [mem] after {stage}: peak {peak:.2f} GB, free {_free_gb():.1f} GB")
+        except Exception:
+            pass
 
 
 def normalise_compact(df, chunk=1_000_000):
@@ -166,28 +203,35 @@ def _normalize_version():
         return hashlib.sha256(f.read()).hexdigest()
 
 
-def load_or_normalise(df, work, tag):
+def load_or_normalise(df, work, tag, data_key=""):
     """Normalise, or reload a cached normalisation from a previous run.
 
     Normalising 12.5M records takes ~20 minutes and is entirely deterministic,
     so a crash later in the pipeline should not cost it twice. Two runs were
     already lost that way on 25 Sep.
+
+    The cache is valid only for the same normalize.py AND the same input data
+    (`data_key`): the cache name carries only the split and sample size, so
+    without the data check a run on a different dataset (e.g. a mini dry-run
+    copy) in the same --work folder would silently reuse the wrong frames.
     """
     fp = os.path.join(work, f"norm_{tag}.parquet")
     fz = os.path.join(work, f"norm_{tag}.npz")
-    ver = _normalize_version()
+    ver = _normalize_version() + "|" + data_key
     if os.path.exists(fp) and os.path.exists(fz):
         z = np.load(fz)
         cached = str(z["ver"]) if "ver" in z else "<none>"
         if cached == ver:
             log(f"  reusing cached normalisation for '{tag}'")
-            d = pd.read_parquet(fp)
+            # skip the raw text columns at read time: they are dropped right after
+            # anyway, and reading them first is a ~2.8 GB transient on train
+            cols = [c for c in pq.ParquetFile(fp).schema_arrow.names if c not in RAW_COLS]
+            d = pd.read_parquet(fp, columns=cols)
             return d, (z["pf"], z["po"]), (z["nf"], z["no"])
         # A cache built by different normalisation code is silently wrong: every
         # number downstream would be computed from text the current code would
         # not produce, with nothing to show for it. Rebuild rather than reuse.
-        log(f"  normalize.py changed since cache for '{tag}' "
-            f"({cached[:8]} -> {ver[:8]}); re-normalising")
+        log(f"  cache for '{tag}' is from different normalize.py or data; re-normalising")
     d, p, nm = normalise_compact(df)
     try:
         d.to_parquet(fp, index=False)
@@ -249,10 +293,15 @@ def block_split(s1, s23, work, tag, truth=None, s1_fold=None):
     string features can be recomputed later without re-blocking and without a
     pair-length string column ever existing.
     """
-    pos1 = pd.Series(np.arange(len(s1), dtype=np.int32), index=s1["entity_id"].to_numpy())
-    pos23 = pd.Series(np.arange(len(s23), dtype=np.int32), index=s23["entity_id"].to_numpy())
+    idx1 = pd.Index(s1["entity_id"].to_numpy())
+    idx23 = pd.Index(s23["entity_id"].to_numpy())
     b_is_s3 = s23["entity_id"].str.startswith("S3").to_numpy().astype(np.float32)
     s23_countries = set(s23["country_n"])
+    # Per-POSITION fold and |truth|, so labels and recall stats never need a
+    # per-pair string lookup beyond the one membership test for y.
+    fold_by_pos = s1["entity_id"].map(s1_fold).to_numpy() if s1_fold is not None else None
+    ntrue_by_pos = (np.fromiter((len(truth.get(s, ())) for s in s1["entity_id"]),
+                                dtype=np.int64, count=len(s1)) if truth is not None else None)
     paths, n_pairs, cover_num, cover_den, hit, tot = [], 0, 0, 0, 0, 0
 
     for c, s1g in s1.groupby("country_n"):
@@ -263,38 +312,42 @@ def block_split(s1, s23, work, tag, truth=None, s1_fold=None):
         cand = generate_candidates(s1g, s23g, by_country=False)
         if cand.empty:
             continue
-        ia = pos1.loc[cand["s1_id"]].to_numpy(np.int32)
-        ib = pos23.loc[cand["cand_id"]].to_numpy(np.int32)
-
-        if truth is not None:   # blocking quality, measured before anything is dropped
-            cset = cand.groupby("s1_id")["cand_id"].agg(set)
-            for s in s1g["entity_id"]:
-                t = truth.get(s, set())
-                got = cset.get(s, set())
-                tot += len(t); hit += len(t & got)
-                cover_num += (t <= got); cover_den += 1
+        # get_indexer returns positions only; pos.loc[labels] also built a label
+        # index as long as the pair frame (~0.8 GB per 100M pairs).
+        ia = idx1.get_indexer(cand["s1_id"]).astype(np.int32)
+        ib = idx23.get_indexer(cand["cand_id"]).astype(np.int32)
+        if (ia < 0).any() or (ib < 0).any():
+            raise AssertionError(f"blocking '{c}': candidate id not found in its split")
 
         y = None
         if truth is not None:
             y = np.fromiter((cid in truth.get(sid, ()) for sid, cid
                              in zip(cand["s1_id"], cand["cand_id"])),
                             dtype=np.int8, count=len(cand))
-        # group-by keys become the integer positions: no strings from here on
-        frame = pd.DataFrame({"ia": ia, "ib": ib,
-                              "cos_name": cand["cos_name"].to_numpy(np.float32),
-                              "cos_full": cand["cos_full"].to_numpy(np.float32),
-                              "cos_addr": cand["cos_addr"].to_numpy(np.float32)})
-        frame = frame.rename(columns={"ia": "s1_id", "ib": "cand_id"})
+            # Blocking quality, before anything is dropped. Candidate pairs are
+            # unique, so an entity's labelled hits are exactly |truth & candidates|
+            # -- the same numbers the old per-entity Python sets gave, without
+            # holding every candidate id in a set.
+            g1 = idx1.get_indexer(s1g["entity_id"])
+            hits = np.bincount(ia[y == 1], minlength=len(s1))[g1]
+            nt = ntrue_by_pos[g1]
+            tot += int(nt.sum()); hit += int(hits.sum())
+            cover_num += int((hits == nt).sum()); cover_den += len(s1g)
+        cos = {k: cand[k].to_numpy(np.float32) for k in ("cos_name", "cos_full", "cos_addr")}
+        del cand                # entity-id strings are not needed past this point
+        gc.collect()
+        # group-by keys are the integer positions: no strings from here on
+        frame = pd.DataFrame({"s1_id": ia, "cand_id": ib, **cos})
         add_context_features(frame, b_is_s3, ib)
         frame = frame.rename(columns={"s1_id": "ia", "cand_id": "ib"})
         if y is not None:
             frame["y"] = y
-            frame["fold"] = pd.Series(cand["s1_id"].map(s1_fold).to_numpy()).astype(np.int8)
+            frame["fold"] = fold_by_pos[ia].astype(np.int8)
         n_pairs += len(frame)
         p = os.path.join(work, f"pairs_{tag}_{c or 'na'}.parquet")
-        frame.to_parquet(p, index=False)
+        frame.to_parquet(p, index=False, row_group_size=ROW_GROUP)
         paths.append(p)
-        del cand, frame, ia, ib, y
+        del frame, ia, ib, y, cos
         gc.collect()
         _profile(f"blocking '{c}'")
 
@@ -320,7 +373,15 @@ def _free_gb():
         ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
         return m.ullAvailPhys / 1e9
     except Exception:
-        return float("inf")     # unknown -> do not let the guard block anything
+        pass
+    try:                        # Linux / cloud VMs
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 1e6
+    except Exception:
+        pass
+    return 0.0                  # unknown -> assume tight, so the planner stays serial
 
 
 def _peak_rss_gb():
@@ -342,6 +403,11 @@ def _peak_rss_gb():
         ps.GetProcessMemoryInfo(k.GetCurrentProcess(), ctypes.byref(c), c.cb)
         return c.PeakWorkingSetSize / 1e9
     except Exception:
+        pass
+    try:                                        # Linux: ru_maxrss is in KB
+        import resource
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6
+    except Exception:
         return 0.0
 
 
@@ -350,9 +416,15 @@ def _load_norm_cache(work, tag):
     load_or_normalise, without the raw frame it would otherwise need). Used to
     reload the split frames in the PARENT after parallel blocking, once the
     workers -- which read their slices straight from the same cache -- are done."""
-    d = pd.read_parquet(os.path.join(work, f"norm_{tag}.parquet"))
+    d = _slim(pd.read_parquet(os.path.join(work, f"norm_{tag}.parquet")))
     z = np.load(os.path.join(work, f"norm_{tag}.npz"))
     return d, (z["pf"], z["po"]), (z["nf"], z["no"])
+
+
+def _slim(df):
+    """Drop the raw text columns once normalised: nothing downstream reads them,
+    and they are about a third of the frame's memory."""
+    return df.drop(columns=[c for c in RAW_COLS if c in df.columns])
 
 
 def _block_group_worker(country, s1_pq, s23_pq, out_dir, tag, truth_sub, fold_sub):
@@ -405,31 +477,30 @@ def _block_group_worker(country, s1_pq, s23_pq, out_dir, tag, truth_sub, fold_su
         st["peak_gb"] = _peak_rss_gb()
         return st
 
-    pos1 = pd.Series(np.arange(len(s1g)), index=s1g["entity_id"].to_numpy())
-    pos23 = pd.Series(np.arange(len(s23g)), index=s23g["entity_id"].to_numpy())
-    ia_l = pos1.loc[cand["s1_id"]].to_numpy()
-    ib_l = pos23.loc[cand["cand_id"]].to_numpy()
+    ia_l = pd.Index(s1g["entity_id"].to_numpy()).get_indexer(cand["s1_id"])
+    ib_l = pd.Index(s23g["entity_id"].to_numpy()).get_indexer(cand["cand_id"])
+    if (ia_l < 0).any() or (ib_l < 0).any():
+        raise AssertionError(f"worker '{country}': candidate id not found in its slice")
     ia_g = gpos1[ia_l].astype(np.int32)     # int32 to match the serial path exactly
     ib_g = gpos23[ib_l].astype(np.int32)
     b_is_s3 = s23g["entity_id"].str.startswith("S3").to_numpy().astype(np.float32)
-
-    if truth_sub is not None:               # blocking quality, before anything is dropped
-        cset = cand.groupby("s1_id")["cand_id"].agg(set)
-        st["cover_den"] = len(s1g)
-        for s in s1g["entity_id"]:
-            t = truth_sub.get(s, set())
-            got = cset.get(s, set())
-            st["tot"] += len(t); st["hit"] += len(t & got); st["cover_num"] += (t <= got)
 
     y = None
     if truth_sub is not None:
         y = np.fromiter((cid in truth_sub.get(sid, ()) for sid, cid
                          in zip(cand["s1_id"], cand["cand_id"])), dtype=np.int8, count=len(cand))
+        # blocking quality from the labels, exactly as in block_split
+        hits = np.bincount(ia_l[y == 1], minlength=len(s1g))
+        nt = np.fromiter((len(truth_sub.get(s, ())) for s in s1g["entity_id"]),
+                         dtype=np.int64, count=len(s1g))
+        st["cover_den"] = len(s1g)
+        st["tot"] = int(nt.sum()); st["hit"] = int(hits.sum())
+        st["cover_num"] = int((hits == nt).sum())
+    cos = {k: cand[k].to_numpy(np.float32) for k in ("cos_name", "cos_full", "cos_addr")}
+    del cand
+    gc.collect()
 
-    frame = pd.DataFrame({"s1_id": ia_g, "cand_id": ib_g,
-                          "cos_name": cand["cos_name"].to_numpy(np.float32),
-                          "cos_full": cand["cos_full"].to_numpy(np.float32),
-                          "cos_addr": cand["cos_addr"].to_numpy(np.float32)})
+    frame = pd.DataFrame({"s1_id": ia_g, "cand_id": ib_g, **cos})
     # is_s3 is looked up with LOCAL ib into a LOCAL flag array (same record, same
     # value); the rank/competition groupbys use the frame's own s1_id/cand_id,
     # which hold GLOBAL positions -- identical grouping to the serial path.
@@ -437,11 +508,12 @@ def _block_group_worker(country, s1_pq, s23_pq, out_dir, tag, truth_sub, fold_su
     frame = frame.rename(columns={"s1_id": "ia", "cand_id": "ib"})
     if y is not None:
         frame["y"] = y
-        frame["fold"] = pd.Series(cand["s1_id"].map(fold_sub).to_numpy()).astype(np.int8)
+        fold_local = s1g["entity_id"].map(fold_sub).to_numpy()
+        frame["fold"] = fold_local[ia_l].astype(np.int8)
 
     st["n_pairs"] = len(frame)
     p = os.path.join(out_dir, f"pairs_{tag}_{country or 'na'}.parquet")
-    frame.to_parquet(p, index=False)
+    frame.to_parquet(p, index=False, row_group_size=ROW_GROUP)
     st["path"] = p
     st["peak_gb"] = _peak_rss_gb()
     return st
@@ -477,7 +549,11 @@ def block_split_parallel(work, tag, s1_pq, s23_pq, countries, s1_len,
     paths = []
     agg = {"n_pairs": 0, "hit": 0, "tot": 0, "cover_num": 0, "cover_den": 0}
     peak = 0.0
-    with ProcessPoolExecutor(max_workers=max_workers) as ex:
+    # spawn on every platform: it is the mode tested on Windows, and Linux's default
+    # fork can deadlock a child after the parent has initialised OpenMP (LightGBM).
+    import multiprocessing
+    with ProcessPoolExecutor(max_workers=max_workers,
+                             mp_context=multiprocessing.get_context("spawn")) as ex:
         futs = {ex.submit(_block_group_worker, c, s1_pq, s23_pq, work, tag,
                           None if truth_by_country is None else truth_by_country.get(c),
                           None if fold_by_country is None else fold_by_country.get(c)): c
@@ -509,29 +585,30 @@ def predict_paths(paths, models, a, b, fold_col=None):
     """
     keep_ia, keep_ib, keep_p, keep_y = [], [], [], []
     for path in paths:
-        df = pd.read_parquet(path)
-        ctx = df[CONTEXT_FEATURES].to_numpy(np.float32)
-        ia, ib = df["ia"].to_numpy(), df["ib"].to_numpy()
-        folds = df[fold_col].to_numpy() if fold_col else None
-        p_all = np.empty(len(df), dtype=np.float32)
-        for start, stop, sf in iter_string_features(ia, ib, a, b, chunk=PRED_CHUNK):
-            X = np.hstack([ctx[start:stop], sf])
-            if folds is None:                 # test: average the fold models
-                p_all[start:stop] = np.mean([m.predict_proba(X)[:, 1] for m in models], axis=0)
+        has_y = "y" in pq.ParquetFile(path).schema_arrow.names
+        n_done, t0 = 0, time.time()
+        # Streamed in bounded batches: the whole US group is ~50M rows, and loading
+        # it at once is what pushed the 25 Sep run into swap.
+        for df in _iter_frames(path):
+            ia, ib = df["ia"].to_numpy(), df["ib"].to_numpy()
+            X = np.hstack([df[CONTEXT_FEATURES].to_numpy(np.float32),
+                           string_features(ia, ib, a, b)])
+            if fold_col is None:              # test: average the fold models
+                p_all = np.mean([m.predict_proba(X)[:, 1] for m in models], axis=0).astype(np.float32)
             else:                             # train: each pair scored out-of-fold
-                blk = np.zeros(stop - start, dtype=np.float32)
-                fb = folds[start:stop]
+                p_all = np.zeros(len(df), dtype=np.float32)
+                fb = df[fold_col].to_numpy()
                 for f, m in enumerate(models):
                     sel = fb == f
                     if sel.any():
-                        blk[sel] = m.predict_proba(X[sel])[:, 1]
-                p_all[start:stop] = blk
-            del X, sf
-        m = p_all >= P_KEEP
-        keep_ia.append(ia[m]); keep_ib.append(ib[m]); keep_p.append(p_all[m])
-        if "y" in df:
-            keep_y.append(df["y"].to_numpy()[m])
-        del df, ctx, p_all
+                        p_all[sel] = m.predict_proba(X[sel])[:, 1]
+            keep = p_all >= P_KEEP
+            keep_ia.append(ia[keep]); keep_ib.append(ib[keep]); keep_p.append(p_all[keep])
+            if has_y:
+                keep_y.append(df["y"].to_numpy()[keep])
+            n_done += len(df)
+            del df, X, p_all
+        log(f"  predicted {os.path.basename(path)}: {n_done:,} pairs in {time.time()-t0:.0f}s")
         gc.collect()
         _profile(f"predict {os.path.basename(path)}")
     out = {"ia": np.concatenate(keep_ia), "ib": np.concatenate(keep_ib),
@@ -539,6 +616,385 @@ def predict_paths(paths, models, a, b, fold_col=None):
     if keep_y:
         out["y"] = np.concatenate(keep_y)
     return out
+
+
+def _iter_frames(path, batch=PRED_CHUNK, columns=None):
+    """Yield a spilled pair parquet as bounded pandas batches."""
+    for rb in pq.ParquetFile(path).iter_batches(batch_size=batch, columns=columns):
+        yield rb.to_pandas()
+
+
+def _n_rows(path):
+    return pq.ParquetFile(path).metadata.num_rows
+
+
+class SavedModel:
+    """A fold model reloaded from disk, with the predict_proba the pipeline uses.
+
+    Every model -- freshly trained or resumed -- is saved at its best iteration
+    and predicted through this class, so a resumed run scores exactly as a
+    fresh one would. Booster.predict on a binary objective returns P(match)."""
+
+    def __init__(self, path):
+        self.path = path
+        self.booster = lgb.Booster(model_file=path)
+
+    def predict_proba(self, X):
+        p = self.booster.predict(X)
+        return np.column_stack([1.0 - p, p])
+
+
+# ---------------------------------------------------------------------------
+# Resumable stages. A full run is many hours; a crash, an OOM or a cloud session
+# timeout late in the run must not cost the stages before it. Each stage writes
+# its outputs, then a small marker holding a SIGNATURE of the code and settings
+# that produced them. Rerunning the same command reuses a stage only when its
+# marker exists, the signature matches and every file is present -- so a stale
+# artifact from different code or data is never reused silently.
+# ---------------------------------------------------------------------------
+# Bump when the logic in THIS file changes what a stage writes. The imported
+# modules (normalize, blocking, pair_features) are hashed automatically.
+STAGE_LOGIC_VERSION = "2026-09-26a"
+
+
+def _src_hash(*names):
+    """Content hash of source files in src/, so editing them invalidates stages."""
+    h = hashlib.sha256()
+    here = os.path.dirname(os.path.abspath(__file__))
+    for n in names:
+        with open(os.path.join(here, n), "rb") as f:
+            h.update(f.read())
+    return h.hexdigest()[:16]
+
+
+def _data_sig(data_dir, split):
+    """Size plus a hash of the first and last MB of each input TSV: cheap on
+    GB-sized files, and enough to notice a different or re-extracted dataset."""
+    out = []
+    d = os.path.join(data_dir, split)
+    for name in sorted(os.listdir(d)):
+        p = os.path.join(d, name)
+        if not name.endswith(".tsv"):
+            continue
+        size = os.path.getsize(p)
+        h = hashlib.sha256()
+        with open(p, "rb") as f:
+            h.update(f.read(1 << 20))
+            if size > (1 << 20):
+                f.seek(max(size - (1 << 20), 0))
+                h.update(f.read(1 << 20))
+        out.append([name, size, h.hexdigest()[:12]])
+    return out
+
+
+def _sig(*parts):
+    return hashlib.sha256(json.dumps(parts, sort_keys=True, default=str).encode()).hexdigest()[:20]
+
+
+def _stage_file(work, name):
+    return os.path.join(work, f"stage_{name}.json")
+
+
+def _stage_load(work, name, sig):
+    """The stage's saved marker if it can be trusted, else None."""
+    p = _stage_file(work, name)
+    if not os.path.exists(p):
+        return None
+    try:
+        with open(p) as f:
+            m = json.load(f)
+    except Exception:
+        return None
+    if m.get("sig") != sig:
+        log(f"  stage '{name}': saved outputs are from different code/settings -> recomputing")
+        return None
+    missing = [x for x in m.get("files", []) if not os.path.exists(x)]
+    if missing:
+        log(f"  stage '{name}': {len(missing)} saved file(s) missing -> recomputing")
+        return None
+    log(f"  stage '{name}': RESUMING from outputs saved {m.get('when', '?')}")
+    return m
+
+
+def _stage_clear(work, name):
+    """Remove a marker BEFORE recomputing, so a crash mid-stage can never leave a
+    marker pointing at half-written files."""
+    p = _stage_file(work, name)
+    if os.path.exists(p):
+        os.remove(p)
+
+
+def _stage_save(work, name, sig, files, data):
+    m = {"sig": sig, "files": list(files), "data": data,
+         "when": time.strftime("%Y-%m-%d %H:%M:%S")}
+    tmp = _stage_file(work, name) + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(m, f, indent=1, default=str)
+    os.replace(tmp, _stage_file(work, name))
+
+
+def _total_ram_gb():
+    try:
+        import ctypes
+
+        class MS(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+        m = MS(); m.dwLength = ctypes.sizeof(MS)
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
+        return m.ullTotalPhys / 1e9
+    except Exception:
+        try:                                   # Linux / cloud VMs
+            return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9
+        except Exception:
+            return float("nan")
+
+
+def train_fold_models(paths, a, b, s1_fold, work, tag):
+    """Assemble the uniform training sample by STREAMING the spilled pair frames,
+    then fit one LightGBM per fold and save each at its best iteration.
+
+    X is preallocated for the expected sample size (+1% slack, ~50x the binomial
+    standard deviation) rather than stacked from pieces, which would briefly hold
+    it twice -- ~4.5 GB instead of ~2.2 GB at 20M rows."""
+    total = sum(_n_rows(p) for p in paths)
+    frac = min(1.0, MAX_TRAIN_PAIRS / max(total, 1))
+    cap = total if frac >= 1.0 else int(total * frac * 1.01) + 10_000
+    nctx = len(CONTEXT_FEATURES)
+    X = np.empty((cap, len(FEATURES)), dtype=np.float32)
+    y = np.empty(cap, dtype=np.int8)
+    fold = np.empty(cap, dtype=np.int8)
+    rng = np.random.default_rng(SEED)
+    n, t0 = 0, time.time()
+    log(f"assembling training sample: {total:,} pairs, sampling {frac:.1%}")
+    for p in paths:
+        for df in _iter_frames(p):
+            sel = np.ones(len(df), bool) if frac >= 1.0 else rng.random(len(df)) < frac
+            sub = df[sel]
+            k = len(sub)
+            if not k:
+                continue
+            if n + k > len(X):                  # practically unreachable; grow, never truncate
+                extra = max(k, len(X) // 10)
+                X = np.concatenate([X, np.empty((extra, X.shape[1]), np.float32)])
+                y = np.concatenate([y, np.empty(extra, np.int8)])
+                fold = np.concatenate([fold, np.empty(extra, np.int8)])
+            X[n:n + k, :nctx] = sub[CONTEXT_FEATURES].to_numpy(np.float32)
+            X[n:n + k, nctx:] = string_features(sub["ia"].to_numpy(), sub["ib"].to_numpy(), a, b)
+            y[n:n + k] = sub["y"].to_numpy()
+            fold[n:n + k] = sub["fold"].to_numpy()
+            n += k
+            del df, sub
+    X, y, fold = X[:n], y[:n], fold[:n]
+    log(f"training on {n:,} of {total:,} pairs ({frac:.1%}), positives {y.mean():.3%} "
+        f"(features {time.time()-t0:.0f}s)")
+    _profile("training sample")
+
+    fold_paths, best = [], []
+    for f in sorted(set(s1_fold.values())):
+        tr, va = fold != f, fold == f
+        if not va.any():                        # only possible in tiny smoke samples
+            fold_paths.append(fold_paths[-1] if fold_paths else None)
+            best.append(None)
+            continue
+        t1 = time.time()
+        m = fit_model(X[tr], y[tr], X[va], y[va])
+        mp = os.path.join(work, f"model_{tag}_fold{f}.txt")
+        m.booster_.save_model(mp, num_iteration=m.best_iteration_ or None)
+        fold_paths.append(mp)
+        best.append(int(m.best_iteration_ or 0))
+        log(f"fold {f}: best_iter={m.best_iteration_} ({time.time()-t1:.0f}s)")
+        del m
+        gc.collect()
+    first = next(p for p in fold_paths if p)
+    fold_paths = [p or first for p in fold_paths]
+    info = {"fold_model_paths": fold_paths, "best_iterations": best,
+            "train_pairs_total": int(total), "train_pairs_sampled_frac": float(frac),
+            "train_rows": int(n), "train_positive_rate": float(y.mean())}
+    del X, y, fold
+    gc.collect()
+    _profile("training")
+    return info
+
+
+def cv_stage(pairs, truth, s1_ids, s1_fold, one_to_one, country_map=None):
+    """Threshold on OOF, the honest cross-fitted CV, and the LOCO check.
+
+    The CV number is cross_fitted_score() -- the one AGENTS.md says to report.
+    Per-fold scores are recovered by re-applying the thresholds it chose to each
+    fold (no second copy of the tuning protocol), and checked to average back to
+    its mean exactly, so the two can never silently disagree."""
+    best_t, best_s, curve = tune(pairs, truth, s1_ids, one_to_one)
+    honest, fold_ts = cross_fitted_score(pairs, truth, s1_fold, one_to_one)
+    fold_scores = []
+    for f, t in zip(sorted(set(s1_fold.values())), fold_ts):
+        va = [s for s, k in s1_fold.items() if k == f]
+        fold_scores.append(macro_f05(apply_rule(pairs[pairs["s1_id"].isin(va)], t, one_to_one),
+                                     truth, va))
+    if abs(float(np.mean(fold_scores)) - honest) > 1e-9:
+        raise AssertionError(f"per-fold scores {fold_scores} do not average to CV {honest}")
+    pred = apply_rule(pairs, best_t, one_to_one)
+    P, R = precision_recall(pred, truth, s1_ids)
+    out = dict(oof_best_t=float(best_t), oof_macro_f05_at_best_t=float(best_s),
+               cv_macro_f05_cross_fitted=float(honest),
+               fold_thresholds=[float(t) for t in fold_ts],
+               fold_scores=[float(x) for x in fold_scores],
+               oof_pair_precision=float(P), oof_pair_recall=float(R),
+               empty_baseline_macro_f05=float(macro_f05({}, truth, s1_ids)),
+               oof_pred_nonempty_share=sum(1 for s in s1_ids if pred.get(s)) / max(len(s1_ids), 1),
+               threshold_curve=[[float(t), float(s)] for t, s in curve])
+
+    # Leave-one-country-out: the only proxy we have for unseen France.
+    if country_map is not None and country_map.nunique() > 1:
+        c_of_pair = pairs["s1_id"].astype(str).map(country_map)
+        out["loco"] = {}
+        for c in sorted(c_of_pair.dropna().unique()):
+            held = (c_of_pair == c).to_numpy()
+            ids_c = country_map[country_map == c].index.tolist()
+            # The threshold must come from the countries we kept. Tuning it on all
+            # OOF pairs -- including the held-out country -- would contaminate the
+            # one signal we have for unseen France and read optimistically.
+            t_c, _, _ = tune(pairs[~held], truth, country_map[country_map != c].index.tolist(), one_to_one)
+            sc = macro_f05(apply_rule(pairs[held], t_c, one_to_one), truth, ids_c)
+            out["loco"][c] = {"score": float(sc), "threshold_from_other_countries": float(t_c)}
+    return out
+
+
+def write_candidates(path, t_ids, t23_ids, paths):
+    """candidate_pairs.tsv, streamed from the spilled test pair frames.
+
+    Same format as data_io.write_id_lists (one row per S1 id in order, sorted
+    de-duplicated ids), but built by sorting integer positions instead of
+    holding ~70M ids in Python sets (several GB)."""
+    ia = np.concatenate([pd.read_parquet(p, columns=["ia"])["ia"].to_numpy() for p in paths])
+    ib = np.concatenate([pd.read_parquet(p, columns=["ib"])["ib"].to_numpy() for p in paths])
+    order = np.argsort(ia, kind="stable")
+    ia, ib = ia[order], ib[order]
+    bounds = np.searchsorted(ia, np.arange(len(t_ids) + 1))
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write("source1_entity_id\tcandidate_entity_ids\n")
+        for i, s in enumerate(t_ids):
+            lo, hi = bounds[i], bounds[i + 1]
+            ids = sorted(set(t23_ids[ib[lo:hi]].tolist())) if hi > lo else []
+            f.write(f"{s}\t{','.join(ids)}\n")
+    return int(len(ia))
+
+
+def verify_outputs(out_dir, t_ids, t23_ids):
+    """Hard checks of the two submission files against the rules in AGENTS.md
+    section 3. Independent of the organisers' validator, so the run fails loudly
+    here even on a machine that does not have it. Raises on any violation."""
+    mpath = os.path.join(out_dir, "matching_results.tsv")
+    cpath = os.path.join(out_dir, "candidate_pairs.tsv")
+    s23 = set(t23_ids.tolist())
+    rows = nonempty = matched = cands = 0
+    with open(mpath, encoding="utf-8") as fm, open(cpath, encoding="utf-8") as fc:
+        if next(fm) != "source1_entity_id\tmatched_entity_ids\n":
+            raise AssertionError("matching_results.tsv: bad header")
+        if next(fc) != "source1_entity_id\tcandidate_entity_ids\n":
+            raise AssertionError("candidate_pairs.tsv: bad header")
+        for s, lm, lc in zip(t_ids, fm, fc):
+            sm, ml = lm.rstrip("\n").split("\t")
+            sc, cl = lc.rstrip("\n").split("\t")
+            if sm != s or sc != s:
+                raise AssertionError(f"row {rows}: expected {s}, got {sm} / {sc}")
+            m = ml.split(",") if ml else []
+            c = cl.split(",") if cl else []
+            if len(set(m)) != len(m):
+                raise AssertionError(f"{s}: duplicate ids in matched list")
+            cset = set(c)
+            if not set(m) <= cset:
+                raise AssertionError(f"{s}: matched ids not in candidate_pairs")
+            if not cset <= s23:
+                raise AssertionError(f"{s}: candidate id not in the test S2/S3 set")
+            rows += 1; nonempty += bool(m); matched += len(m); cands += len(c)
+        if next(fm, None) is not None or next(fc, None) is not None:
+            raise AssertionError("extra rows after the last S1 id")
+    if rows != len(t_ids):
+        raise AssertionError(f"{rows} rows written, {len(t_ids)} S1 test ids expected")
+    return {"rows": rows, "nonempty_rows": nonempty, "matched_ids": matched, "candidate_ids": cands}
+
+
+class _Tee:
+    """Write to the console and a log file at once (flushes every write, so a
+    crash never loses the tail of the log)."""
+
+    def __init__(self, stream, fh):
+        self.stream, self.fh = stream, fh
+
+    def write(self, s):
+        self.stream.write(s)
+        self.fh.write(s)
+        self.fh.flush()
+        return len(s)
+
+    def flush(self):
+        self.stream.flush()
+        self.fh.flush()
+
+    def __getattr__(self, name):            # encoding, isatty, fileno, ... -> the console
+        return getattr(self.stream, name)
+
+
+def _tee_output(path):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    fh = open(path, "a", encoding="utf-8", buffering=1)
+    fh.write(f"\n===== run started {time.strftime('%Y-%m-%d %H:%M:%S')} : {' '.join(sys.argv)} =====\n")
+    sys.stdout = _Tee(sys.stdout, fh)
+    sys.stderr = _Tee(sys.stderr, fh)
+
+
+def _git_commit():
+    try:
+        r = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True,
+                           cwd=os.path.dirname(os.path.abspath(__file__)))
+        dirty = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"],
+                               capture_output=True, text=True,
+                               cwd=os.path.dirname(os.path.abspath(__file__))).stdout.strip()
+        return r.stdout.strip() + ("-dirty" if dirty else "")
+    except Exception:
+        return "unknown"
+
+
+def _sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 24), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def preflight(args, smoke):
+    """Fail fast on anything that would waste a multi-hour run, and say loudly
+    when the machine is too small. Returns a dict for the report."""
+    problems = []
+    for split, files in [("train", ["train_source1.tsv", "train_source2.tsv",
+                                    "train_source3.tsv", "train_ground_truth.tsv"]),
+                         ("test", ["test_source1.tsv", "test_source2.tsv", "test_source3.tsv"])]:
+        for f in files:
+            if not os.path.exists(os.path.join(args.data, split, f)):
+                problems.append(f"missing {os.path.join(args.data, split, f)}")
+    if problems:
+        raise SystemExit("PRE-FLIGHT FAILED:\n  " + "\n  ".join(problems))
+    import shutil
+    ram = _total_ram_gb()
+    disk = shutil.disk_usage(os.path.abspath(args.work)).free / 1e9
+    info = {"ram_total_gb": round(ram, 1), "disk_free_gb": round(disk, 1),
+            "cpus": os.cpu_count(), "python": sys.version.split()[0]}
+    log(f"pre-flight: {info}")
+    if not smoke and ram < MIN_RAM_GB:
+        log(f"  !!! WARNING: {ram:.0f} GB RAM < {MIN_RAM_GB:.0f} GB. A full run on this machine "
+            f"is expected to swap and take many times longer. Use a bigger machine. !!!")
+    if not smoke and disk < 25:
+        raise SystemExit(f"PRE-FLIGHT FAILED: only {disk:.0f} GB free in {args.work}; a full run "
+                         f"writes ~15-20 GB of intermediate files. Free space or move --work.")
+    if not smoke and not os.path.exists(os.path.join(args.work, "folds.csv")):
+        log("  !!! WARNING: work/folds.csv not found -- it will be regenerated. It should be "
+            "the committed file (git pull) so CV numbers stay comparable. !!!")
+    return info
 
 
 def to_pairs_frame(d, s1_ids, s23_ids, s1_fold=None):
@@ -570,13 +1026,33 @@ def main():
                     help="blocking parallelism across country groups, using PROCESSES "
                          "(threads segfault rapidfuzz). 1 = serial (default). The count is "
                          "capped by group count and free RAM; see _plan_block_workers.")
+    ap.add_argument("--fresh", action="store_true",
+                    help="ignore saved stages and recompute everything (default: resume "
+                         "any stage whose saved outputs match the current code and data)")
+    ap.add_argument("--log", default=None,
+                    help="also append everything printed (including tracebacks) to this file")
     args = ap.parse_args()
+    if args.log:
+        _tee_output(args.log)
     os.makedirs(args.work, exist_ok=True)
+    os.makedirs(args.out, exist_ok=True)
     report = {}
+    t_start = time.time()
 
     smoke = args.sample > 0
+    # Sampled runs get their own artifact names, so a smoke test can never
+    # overwrite -- or be mistaken for -- the full-scale stages.
+    sfx = f"_sample{args.sample}" if smoke else ""
     folds_path = os.path.join(args.work, f"folds_sample{args.sample}.csv" if smoke else "folds.csv")
     report_path = os.path.join(args.work, f"report_sample{args.sample}.json" if smoke else "report.json")
+    report["machine"] = preflight(args, smoke)
+    report["git_commit"] = _git_commit()
+    if args.fresh:
+        for f in os.listdir(args.work):
+            if f.startswith("stage_") and f.endswith(f"{sfx}.json") and (smoke or "_sample" not in f):
+                os.remove(os.path.join(args.work, f))
+        log("--fresh: cleared saved stages")
+    code_sig = {n: _src_hash(n) for n in ("normalize.py", "blocking.py", "pair_features.py")}
     if smoke:
         log(f"*** SMOKE TEST: {args.sample} S1 entities, seed {args.sample_seed}. "
             f"Numbers are NOT comparable to a full run -- do not quote them as CV. ***")
@@ -590,8 +1066,11 @@ def main():
     if smoke:
         s1, s23 = subsample(s1, s23, args.sample, args.sample_seed, truth)
         log(f"sampled train: {len(s1)} S1, {len(s23)} S2/S3")
-    s1, p1r, n1r = load_or_normalise(s1, args.work, f'train_s1{args.sample}')
-    s23, p2r, n2r = load_or_normalise(s23, args.work, f'train_s23{args.sample}')
+    train_key = _sig(_data_sig(args.data, "train"), args.sample, args.sample_seed)
+    s1, p1r, n1r = load_or_normalise(s1, args.work, f'train_s1{args.sample}', train_key)
+    s23, p2r, n2r = load_or_normalise(s23, args.work, f'train_s23{args.sample}', train_key)
+    s1, s23 = _slim(s1), _slim(s23)
+    gc.collect()
     s1_ids_arr, s23_ids_arr = s1["entity_id"].to_numpy(), s23["entity_id"].to_numpy()
     s1_ids = s1_ids_arr.tolist()
     truth = {s: truth.get(s, set()) for s in s1_ids}
@@ -605,10 +1084,20 @@ def main():
     _profile("load+normalise train")
 
     s1_fold = make_s1_folds(s1_ids, path=folds_path, seed=SEED)
+    with open(folds_path, "rb") as f:
+        folds_hash = hashlib.sha256(f.read()).hexdigest()[:16]
+    report["folds_sha256_16"] = folds_hash
 
     log("blocking train")
-    workers = _plan_block_workers(args.block_workers, s1["country_n"].nunique())
-    if workers > 1:
+    tag = f"train{sfx}"
+    sig_bt = _sig("block", tag, code_sig, STAGE_LOGIC_VERSION, _data_sig(args.data, "train"),
+                  args.sample, args.sample_seed, folds_hash)
+    saved = _stage_load(args.work, f"block_{tag}", sig_bt)
+    workers = 1 if saved else _plan_block_workers(args.block_workers, s1["country_n"].nunique())
+    if saved:
+        paths, bstats = saved["files"], saved["data"]
+    elif workers > 1:
+        _stage_clear(args.work, f"block_{tag}")
         # Parallel: workers read their slices from the cache, so free the parent's
         # frames first (they would otherwise sit alongside every worker's slice and
         # blow the RAM budget), then reload from the same cache for the feature stage.
@@ -622,96 +1111,82 @@ def main():
         s1_len = len(s1)
         del s1, s23, p1r, n1r, p2r, n2r
         gc.collect()
-        paths, bstats = block_split_parallel(args.work, "train", s1_pq, s23_pq,
+        paths, bstats = block_split_parallel(args.work, tag, s1_pq, s23_pq,
                                              list(tbc.keys()), s1_len, tbc, fbc, workers)
         s1, p1r, n1r = _load_norm_cache(args.work, f"train_s1{args.sample}")
         s23, p2r, n2r = _load_norm_cache(args.work, f"train_s23{args.sample}")
+        _stage_save(args.work, f"block_{tag}", sig_bt, paths, bstats)
     else:
-        paths, bstats = block_split(s1, s23, args.work, "train", truth=truth, s1_fold=s1_fold)
+        _stage_clear(args.work, f"block_{tag}")
+        paths, bstats = block_split(s1, s23, args.work, tag, truth=truth, s1_fold=s1_fold)
+        _stage_save(args.work, f"block_{tag}", sig_bt, paths, bstats)
     report["blocking_train"] = bstats
     log(f"blocking: {bstats}")
+    _profile("blocking train")
 
+    # full_n exists only for the blocking TF-IDF view; features never read it.
+    s1, s23 = s1.drop(columns=["full_n"]), s23.drop(columns=["full_n"])
+    gc.collect()
     a, b = prepare_side(s1, p1r, n1r), prepare_side(s23, p2r, n2r)
 
-    # ---------- training sample ----------
-    log("assembling training sample")
-    sizes = [pd.read_parquet(p, columns=["y"]).shape[0] for p in paths]
-    total = sum(sizes)
-    frac = min(1.0, MAX_TRAIN_PAIRS / max(total, 1))
-    report["train_pairs_total"] = int(total)
-    report["train_pairs_sampled_frac"] = float(frac)
-    rng = np.random.default_rng(SEED)
-    Xs, ys, fs = [], [], []
-    for p in paths:
-        df = pd.read_parquet(p)
-        sel = np.ones(len(df), bool) if frac >= 1.0 else rng.random(len(df)) < frac
-        sub = df[sel]
-        ctx = sub[CONTEXT_FEATURES].to_numpy(np.float32)
-        sf = np.vstack([s for _, _, s in iter_string_features(
-            sub["ia"].to_numpy(), sub["ib"].to_numpy(), a, b, chunk=PRED_CHUNK)])
-        Xs.append(np.hstack([ctx, sf])); ys.append(sub["y"].to_numpy()); fs.append(sub["fold"].to_numpy())
-        del df, sub, ctx, sf
+    # ---------- training sample + fold models ----------
+    sig_m = _sig("models", sig_bt, LGB_PARAMS, MAX_TRAIN_PAIRS, SEED, FEATURES, STAGE_LOGIC_VERSION)
+    saved = _stage_load(args.work, f"models_{tag}", sig_m)
+    if saved:
+        tinfo = saved["data"]
+    else:
+        _stage_clear(args.work, f"models_{tag}")
+        tinfo = train_fold_models(paths, a, b, s1_fold, args.work, tag)
+        _stage_save(args.work, f"models_{tag}", sig_m,
+                    sorted(set(tinfo["fold_model_paths"])), tinfo)
+    models = [SavedModel(p) for p in tinfo["fold_model_paths"]]
+    report.update(train_pairs_total=tinfo["train_pairs_total"],
+                  train_pairs_sampled_frac=tinfo["train_pairs_sampled_frac"],
+                  train_rows=tinfo["train_rows"], train_positive_rate=tinfo["train_positive_rate"],
+                  best_iterations=tinfo["best_iterations"])
+
+    # ---------- out-of-fold prediction ----------
+    sig_o = _sig("oof", sig_m, P_KEEP)
+    oof_path = os.path.join(args.work, f"oof_pairs{sfx}.parquet")
+    if _stage_load(args.work, f"oof_{tag}", sig_o):
+        pairs = pd.read_parquet(oof_path)
+    else:
+        _stage_clear(args.work, f"oof_{tag}")
+        log("out-of-fold prediction")
+        oof = predict_paths(paths, models, a, b, fold_col="fold")
+        pairs = to_pairs_frame(oof, s1_ids_arr, s23_ids_arr, s1_fold)
+        del oof
         gc.collect()
-    X = np.vstack(Xs); y = np.concatenate(ys); fold = np.concatenate(fs)
-    del Xs, ys, fs
-    gc.collect()
-    log(f"training on {len(X):,} of {total:,} pairs ({frac:.1%}), positives {y.mean():.3%}")
-    _profile("training sample")
-
-    models = []
-    for f in sorted(set(s1_fold.values())):
-        tr, va = fold != f, fold == f
-        if not va.any():
-            models.append(models[-1] if models else None)
-            continue
-        m = fit_model(X[tr], y[tr], X[va], y[va])
-        models.append(m)
-        log(f"fold {f}: best_iter={m.best_iteration_}")
-    del X, y, fold
-    gc.collect()
-    _profile("training")
-
-    log("out-of-fold prediction")
-    oof = predict_paths(paths, models, a, b, fold_col="fold")
-    pairs = to_pairs_frame(oof, s1_ids_arr, s23_ids_arr, s1_fold)
-    del oof
-    gc.collect()
-    pairs.to_parquet(os.path.join(args.work, "oof_pairs.parquet"), index=False)
+        pairs.to_parquet(oof_path, index=False)
+        _stage_save(args.work, f"oof_{tag}", sig_o, [oof_path], {"rows": int(len(pairs))})
     report["oof_pairs_kept"] = int(len(pairs))
     _profile("OOF")
 
-    best_t, best_s, curve = tune(pairs, truth, s1_ids, one_to_one)
-    honest, fold_ts = cross_fitted_score(pairs, truth, s1_fold, one_to_one)
-    pred = apply_rule(pairs, best_t, one_to_one)
-    P, R = precision_recall(pred, truth, s1_ids)
-    report.update(oof_best_t=float(best_t), oof_macro_f05_at_best_t=best_s,
-                  cv_macro_f05_cross_fitted=honest, fold_thresholds=[float(t) for t in fold_ts],
-                  oof_pair_precision=P, oof_pair_recall=R,
-                  empty_baseline_macro_f05=macro_f05({}, truth, s1_ids))
-    log(f"CV macro-F0.5 (cross-fitted) = {honest:.4f} | at t={best_t}: {best_s:.4f} "
-        f"| P={P:.3f} R={R:.3f} | empty baseline = {report['empty_baseline_macro_f05']:.4f}")
-
-    # ---------- leave-one-country-out (proxy for unseen France) ----------
-    if args.loco and s1["country_n"].nunique() > 1:
-        cmap = s1.set_index("entity_id")["country_n"]
-        pairs["c"] = pairs["s1_id"].astype(str).map(cmap)
-        report["loco"] = {}
-        for c in sorted(pairs["c"].dropna().unique()):
-            held = pairs["c"] == c
-            ids_c = cmap[cmap == c].index.tolist()
-            # The threshold must come from the countries we kept. Tuning it on all
-            # OOF pairs -- including the held-out country -- would contaminate the
-            # one signal we have for unseen France and read optimistically.
-            t_c, _, _ = tune(pairs[~held], truth, cmap[cmap != c].index.tolist(), one_to_one)
-            sc = macro_f05(apply_rule(pairs[held], t_c, one_to_one), truth, ids_c)
-            report["loco"][c] = {"score": sc, "threshold_from_other_countries": float(t_c)}
-            log(f"LOCO: hold out '{c}', threshold {t_c} from the rest: {sc:.4f}")
-        pairs.drop(columns="c", inplace=True)
+    # ---------- CV: threshold, honest cross-fitted score, LOCO ----------
+    sig_cv = _sig("cv", sig_o, one_to_one, bool(args.loco))
+    saved = _stage_load(args.work, f"cv_{tag}", sig_cv)
+    if saved:
+        cv = saved["data"]
+    else:
+        _stage_clear(args.work, f"cv_{tag}")
+        cv = cv_stage(pairs, truth, s1_ids, s1_fold, one_to_one,
+                      s1.set_index("entity_id")["country_n"] if args.loco else None)
+        _stage_save(args.work, f"cv_{tag}", sig_cv, [oof_path], cv)
+    report.update(cv)
+    best_t = cv["oof_best_t"]
+    log(f"CV macro-F0.5 (cross-fitted) = {cv['cv_macro_f05_cross_fitted']:.4f} "
+        f"| folds {[round(x, 4) for x in cv['fold_scores']]} "
+        f"| at t={best_t}: {cv['oof_macro_f05_at_best_t']:.4f} "
+        f"| P={cv['oof_pair_precision']:.3f} R={cv['oof_pair_recall']:.3f}")
+    for c, v in cv.get("loco", {}).items():
+        log(f"LOCO: hold out '{c}', threshold {v['threshold_from_other_countries']} "
+            f"from the rest: {v['score']:.4f}")
 
     del pairs, a, b, s1, s23
     gc.collect()
     with open(report_path, "w") as f:
         json.dump(report, f, indent=2, default=str)
+    log(f"CV report written -> {report_path}")
     if args.skip_test:
         log(f"--skip-test: stopping after CV. report -> {report_path}")
         return
@@ -726,14 +1201,25 @@ def main():
         report["sample"]["test_caveat"] = (
             "test S2/S3 sampled without truth, so most real matches are absent; "
             "pred_nonempty_share is not comparable to oof_pred_nonempty_share")
-    t1, tp1r, tn1r = load_or_normalise(t1, args.work, f'test_s1{args.sample}')
-    t23, tp2r, tn2r = load_or_normalise(t23, args.work, f'test_s23{args.sample}')
+    test_key = _sig(_data_sig(args.data, "test"), args.sample, args.sample_seed)
+    t1, tp1r, tn1r = load_or_normalise(t1, args.work, f'test_s1{args.sample}', test_key)
+    t23, tp2r, tn2r = load_or_normalise(t23, args.work, f'test_s23{args.sample}', test_key)
+    t1, t23 = _slim(t1), _slim(t23)
+    gc.collect()
     t1_ids_arr, t23_ids_arr = t1["entity_id"].to_numpy(), t23["entity_id"].to_numpy()
     t_ids = t1_ids_arr.tolist()
+    test_countries = t1["country_n"].value_counts().to_dict()
 
     log("blocking test")
-    tworkers = _plan_block_workers(args.block_workers, t1["country_n"].nunique())
-    if tworkers > 1:
+    ttag = f"test{sfx}"
+    sig_btest = _sig("block", ttag, code_sig, STAGE_LOGIC_VERSION, _data_sig(args.data, "test"),
+                     args.sample, args.sample_seed)
+    saved = _stage_load(args.work, f"block_{ttag}", sig_btest)
+    tworkers = 1 if saved else _plan_block_workers(args.block_workers, t1["country_n"].nunique())
+    if saved:
+        tpaths, tstats = saved["files"], saved["data"]
+    elif tworkers > 1:
+        _stage_clear(args.work, f"block_{ttag}")
         # Test has up to three groups (US / India / France), so it gains most from
         # parallelism. No truth on the test side -> no y, no fold, no recall stats.
         t1_pq = os.path.join(args.work, f"norm_test_s1{args.sample}.parquet")
@@ -742,65 +1228,118 @@ def main():
         t1_len = len(t1)
         del t1, t23, tp1r, tn1r, tp2r, tn2r
         gc.collect()
-        tpaths, tstats = block_split_parallel(args.work, "test", t1_pq, t23_pq,
+        tpaths, tstats = block_split_parallel(args.work, ttag, t1_pq, t23_pq,
                                               tcountries, t1_len, None, None, tworkers)
         t1, tp1r, tn1r = _load_norm_cache(args.work, f"test_s1{args.sample}")
         t23, tp2r, tn2r = _load_norm_cache(args.work, f"test_s23{args.sample}")
+        _stage_save(args.work, f"block_{ttag}", sig_btest, tpaths, tstats)
     else:
-        tpaths, tstats = block_split(t1, t23, args.work, "test")
+        _stage_clear(args.work, f"block_{ttag}")
+        tpaths, tstats = block_split(t1, t23, args.work, ttag)
+        _stage_save(args.work, f"block_{ttag}", sig_btest, tpaths, tstats)
     report["blocking_test"] = tstats
-
-    ta, tb = prepare_side(t1, tp1r, tn1r), prepare_side(t23, tp2r, tn2r)
+    _profile("blocking test")
 
     # candidate_pairs.tsv must be the FINAL candidate list the model scores, so it
-    # is written from the same spilled frames, streamed rather than held in memory.
+    # is written from the same spilled frames the predictions come from.
     log("writing candidate_pairs.tsv")
-    cand_map = {}
-    for p in tpaths:
-        d = pd.read_parquet(p, columns=["ia", "ib"])
-        for ia_v, grp in d.groupby("ia")["ib"]:
-            cand_map.setdefault(t_ids[ia_v], set()).update(t23_ids_arr[grp.to_numpy()])
-        del d
-        gc.collect()
-    write_id_lists(os.path.join(args.out, "candidate_pairs.tsv"), t_ids, cand_map, "candidate_entity_ids")
-    del cand_map
-    gc.collect()
+    n_cand = write_candidates(os.path.join(args.out, "candidate_pairs.tsv"), t_ids, t23_ids_arr, tpaths)
     _profile("candidate_pairs")
 
-    log("test prediction")
-    tp = predict_paths(tpaths, models, ta, tb)
-    tpairs = to_pairs_frame(tp, t1_ids_arr, t23_ids_arr)
-    del tp
-    gc.collect()
-    tpairs.to_parquet(os.path.join(args.work, "test_pairs.parquet"), index=False)
+    sig_tp = _sig("testpred", sig_btest, sig_m, P_KEEP)
+    tp_path = os.path.join(args.work, f"test_pairs{sfx}.parquet")
+    if _stage_load(args.work, f"testpred_{ttag}", sig_tp):
+        tpairs = pd.read_parquet(tp_path)
+    else:
+        _stage_clear(args.work, f"testpred_{ttag}")
+        log("test prediction")
+        t1, t23 = t1.drop(columns=["full_n"]), t23.drop(columns=["full_n"])
+        ta, tb = prepare_side(t1, tp1r, tn1r), prepare_side(t23, tp2r, tn2r)
+        tp = predict_paths(tpaths, models, ta, tb)
+        tpairs = to_pairs_frame(tp, t1_ids_arr, t23_ids_arr)
+        del tp, ta, tb
+        gc.collect()
+        tpairs.to_parquet(tp_path, index=False)
+        _stage_save(args.work, f"testpred_{ttag}", sig_tp, [tp_path], {"rows": int(len(tpairs))})
     tpred = apply_rule(tpairs, best_t, one_to_one)
     write_id_lists(os.path.join(args.out, "matching_results.tsv"), t_ids, tpred, "matched_entity_ids")
 
     report["test"] = {
-        "s1": len(t_ids), "avg_cands_per_s1": tstats["avg_cands_per_s1"],
+        "s1": len(t_ids), "candidate_pairs": n_cand, "avg_cands_per_s1": tstats["avg_cands_per_s1"],
+        "threshold": float(best_t),
         "pred_nonempty_share": sum(1 for s in t_ids if tpred.get(s)) / max(len(t_ids), 1),
-        "oof_pred_nonempty_share": sum(1 for s in s1_ids if pred.get(s)) / len(s1_ids),
-        "countries": t1["country"].value_counts().to_dict(),
+        "oof_pred_nonempty_share": report["oof_pred_nonempty_share"],
+        "countries": test_countries,
     }
     log(f"test: {report['test']}")
-    with open(report_path, "w") as f:
-        json.dump(report, f, indent=2, default=str)
-    log(f"report written to {report_path}")
-    _profile("done")
 
     if smoke:
-        log("smoke test: skipping the official validator (a sampled output covers only "
-            "some test S1 entities, so it would fail the 'every entity present' rule by design)")
+        log("smoke test: output covers only the sampled test S1 entities, so the files are "
+            "NOT a valid submission and the full-set checks are skipped by design")
+        report["runtime_hours"] = round((time.time() - t_start) / 3600, 2)
+        with open(report_path, "w") as f:
+            json.dump(report, f, indent=2, default=str)
         return
 
+    # ---------- hard checks + official validator + summary ----------
+    log("verifying output files")
+    report["output_check"] = verify_outputs(args.out, t_ids, t23_ids_arr)
+    log(f"  output check PASSED: {report['output_check']}")
     validator = os.path.join(os.path.dirname(args.data.rstrip("/\\")), "utils", "validate_submission.py")
     if os.path.exists(validator):
         log("running official validator")
-        subprocess.run([sys.executable, validator, "--matching", os.path.join(args.out, "matching_results.tsv"),
-                        "--candidate", os.path.join(args.out, "candidate_pairs.tsv"),
-                        "--test-dir", os.path.join(args.data, "test"), "--check-ids"])
+        rc = subprocess.run([sys.executable, validator,
+                             "--matching", os.path.join(args.out, "matching_results.tsv"),
+                             "--candidate", os.path.join(args.out, "candidate_pairs.tsv"),
+                             "--test-dir", os.path.join(args.data, "test"), "--check-ids"]).returncode
+        report["official_validator_exit_code"] = rc
+        log(f"  official validator exit code {rc} ({'PASS' if rc == 0 else 'CHECK ITS OUTPUT ABOVE'})")
     else:
-        log(f"validator not found at {validator}; run utils/validate_submission.py manually")
+        report["official_validator_exit_code"] = None
+        log(f"  official validator not found at {validator}; run it by hand before uploading")
+    report["runtime_hours"] = round((time.time() - t_start) / 3600, 2)
+    report["output_sha256"] = {n: _sha256(os.path.join(args.out, n))
+                               for n in ("matching_results.tsv", "candidate_pairs.tsv")}
+    with open(report_path, "w") as f:
+        json.dump(report, f, indent=2, default=str)
+    write_summary(os.path.join(args.out, "RUN_SUMMARY.txt"), report)
+    log(f"DONE. report -> {report_path}; summary -> {os.path.join(args.out, 'RUN_SUMMARY.txt')}")
+    _profile("done")
+
+
+def write_summary(path, r):
+    """One human-readable page: what was run, what it scored, what to upload."""
+    lines = [
+        "RUN SUMMARY -- Amazon ML Challenge 2026, business entity resolution",
+        f"written {time.strftime('%Y-%m-%d %H:%M:%S')} | git {r.get('git_commit')} | "
+        f"runtime {r.get('runtime_hours')} h | machine {r.get('machine')}",
+        "",
+        f"CV macro-F0.5 (cross-fitted, the honest number) : {r.get('cv_macro_f05_cross_fitted'):.4f}",
+        f"  per fold                                      : {[round(x, 4) for x in r.get('fold_scores', [])]}",
+        f"  OOF pair precision / recall                   : {r.get('oof_pair_precision'):.4f} / "
+        f"{r.get('oof_pair_recall'):.4f}",
+        f"  threshold used for test                       : {r.get('oof_best_t')}",
+    ]
+    for c, v in (r.get("loco") or {}).items():
+        lines.append(f"  LOCO hold-out {c:<8s}                         : {v['score']:.4f}")
+    bt = r.get("blocking_train", {})
+    lines += [
+        f"train blocking recall ceiling / entity cover    : {bt.get('pair_recall_ceiling', float('nan')):.4f} / "
+        f"{bt.get('entity_full_cover', float('nan')):.4f}  ({bt.get('avg_cands_per_s1', 0):.1f} cands/S1)",
+        "",
+        f"test S1 rows {r['test']['s1']:,} | candidate pairs {r['test']['candidate_pairs']:,} | "
+        f"non-empty predictions {r['test']['pred_nonempty_share']:.3f} "
+        f"(train OOF {r['test']['oof_pred_nonempty_share']:.3f})",
+        f"test countries: {r['test']['countries']}",
+        f"output check: {r.get('output_check')}",
+        f"official validator exit code: {r.get('official_validator_exit_code')}",
+        "",
+        "FILES TO HAND TO P1 FOR UPLOAD (verify the hashes on the receiving machine):",
+    ]
+    for n, h in (r.get("output_sha256") or {}).items():
+        lines.append(f"  {n}  sha256 {h}")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
 
 
 if __name__ == "__main__":

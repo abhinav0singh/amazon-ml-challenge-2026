@@ -50,20 +50,32 @@ MAX_DF, MIN_DF = 0.01, 2
 MULTIKEY = True
 MAX_BLOCK = 20000
 
-# Cap on candidates kept per S1 entity after the key blocks are unioned.
-# Unioning several keys makes candidates per entity grow with corpus size
-# (19 -> 40 -> 61 at samples 2k -> 10k -> 40k), which is cost the feature stage
-# has to absorb. This IS the final candidate list, so it is also what
-# candidate_pairs.tsv must contain.
+# Cap on candidates kept per S1 entity after the key blocks are unioned, and
+# the score that ranks them for the cap. This IS the final candidate list, so it
+# is also what candidate_pairs.tsv must contain.
 #
-# MEASURED at 40k: cap 40 cut candidates 60.6 -> 38.1 per entity but cost
-# entity cover 0.9546 -> 0.9208. That is far too expensive -- cover is close to
-# a hard cap on macro F0.5, and now that blocking cost is sub-linear we are no
-# longer desperate for the saving. 80 is set so the cap does not bind at any
-# scale measured so far (so it costs nothing observed) while still bounding the
-# worst case at full scale. Tune with real numbers, not intuition -- see the B
-# blocking issue.
-MAX_CANDS = 40
+# MEASURED on the FULL India haystack (scripts/diag_blocking_recall.py: 10,000
+# S1 vs all 4,133,346 India S2/S3, 26 Sep; sampled haystacks hid all of this):
+#
+#   rank by                 cap 40            cap 60            cap 80        no cap
+#   max(3 cosines) [old]  .823 / .656       .926 / .815       .941 / .847   .943 / .853
+#   cos_full + cos_addr   .934 / .829       .942 / .848       .943 / .852   (pair recall / entity cover)
+#
+# The old rule ranked by the MAX of the three cosines. Every branch of a chain
+# ("starbucks", "reliance fresh") scores cos_name = 1.0, so they all tie at the
+# top and the cap kept an ARBITRARY 40 of them -- throwing away the true branch,
+# which differs only by address. That one line cost 0.12 pair recall and 0.20
+# entity cover at full scale (the 25 Sep full run: 0.885 / 0.766). Ranking by
+# name+address cosine plus address cosine breaks those ties on the address.
+#
+# US (10,000 S1 vs all 6,186,873 US S2/S3) confirms it, measured as the oracle
+# macro-F0.5 (a perfect matcher on the candidate set): old rule 0.9713, new rule
+# at cap 80 0.9952, no cap 0.9953 -- the old cap alone cost 0.024 of the score.
+#
+# Before the cap the union holds ~77 (India) / ~83 (US) candidates per S1
+# (p90 104 / 112), so cap 80 keeps the no-cap ceiling while bounding the worst case.
+MAX_CANDS = 80
+CAP_SCORE = ("cos_full", "cos_addr")
 
 
 def _topk_sparse(A, B, k, chunk_rows=CHUNK_ROWS):
@@ -305,13 +317,16 @@ def _block_by_keys(s1: pd.DataFrame, s23: pd.DataFrame, max_block: int = MAX_BLO
 
 
 def _cap_per_entity(cand: pd.DataFrame, max_cands: int) -> pd.DataFrame:
-    """Keep the best `max_cands` candidates per S1 entity, ranked by the
-    strongest of the three cosine views. Ranking on the max rather than on one
-    view avoids discarding a candidate that only the address view liked, which
-    is exactly the renamed-business case the address view exists to catch."""
+    """Keep the best `max_cands` candidates per S1 entity, ranked by
+    cos_full + cos_addr (see CAP_SCORE for the measurement behind it).
+
+    Not the max of the three views: chain branches all score cos_name = 1.0, so a
+    max-rank ties them and the cap keeps an arbitrary subset. cos_full carries the
+    name AND the address, and cos_addr still lifts a renamed business whose
+    address matches -- the case the address view exists to catch."""
     if max_cands <= 0 or cand.empty:
         return cand
-    score = cand[["cos_name", "cos_full", "cos_addr"]].max(axis=1)
+    score = cand[list(CAP_SCORE)].sum(axis=1)
     keep = score.groupby(cand["s1_id"]).rank(ascending=False, method="first") <= max_cands
     return cand[keep].reset_index(drop=True)
 
