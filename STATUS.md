@@ -65,7 +65,23 @@ Only **P1** uploads to the portal, from one device (simultaneous logins can term
 
 Recall ceiling = share of true pairs that survive blocking. Target ≥ 0.98 with a manageable number of candidates per S1.
 
-**All rows below are SAMPLED runs, not full scale.** Sampling keeps the real S2/S3-per-S1 density but shrinks the haystack, so these ceilings are optimistic. No full-scale blocking run has completed yet.
+**All rows below are SAMPLED runs, not full scale.** Sampling keeps the real S2/S3-per-S1 density but shrinks the haystack, so these ceilings are optimistic. **The first full-scale train blocking has now completed — see "FULL SCALE" below; the ceilings are far worse than the samples projected.**
+
+### FULL SCALE (measured 26 Sep 00:34, run started 25 Sep 20:07) — #9 task 1
+
+Config: MULTIKEY, `MAX_CANDS=40`, `n_tok` 3 name / 2 addr, `MAX_BLOCK=20000`.
+
+| Split | total pairs | avg cands/S1 | **pair recall ceiling** | **entity full cover** | blocking wall-clock |
+|---|---|---|---|---|---|
+| train (US+India) | 87,483,735 | 39.64 | **0.8851** | **0.7665** | ~4.5 h (India 1h26m + US ~3h) |
+
+**This is the number Phase 0 was waiting for, and it is a problem.** Sampled B2 at 40k projected 0.9833 / 0.9546; full scale is **0.885 / 0.766**. Sampling optimism is far larger than extrapolated — 23% of entities miss ≥1 true match, so a perfect matcher is already capped well below the 0.98 leaderboard band. Blocking recall, not the decision layer, is now the bottleneck at full scale.
+
+Two measured recall leaks, both actionable (#9 task 2):
+1. **`MAX_CANDS=40` is binding** (avg kept 39.64 ≈ the cap). At 40k, cap 40 cost cover 0.955→0.921 vs cap 80; at full scale the haystack pushes more true matches past 40. NB the code value is 40 while the comment above it argues for 80 — a discrepancy to resolve. Raising the cap costs candidates (≈2×) → memory + feature-time, so it must be paired with the feature-stage fix below.
+2. **Oversized blocks skipped:** 184 (US) + 69 (India) blocks exceeded `MAX_BLOCK=20000` and were dropped for that key; some true pairs live only there. `n_tok` / `MAX_BLOCK` are the levers.
+
+**Separately, the feature stage — not blocking — dominates wall-clock:** assembling the 20M-pair training sample took ~6.5 h (00:34→07:04), single-threaded (rapidfuzz + Python postal/number loops). The OOF pass repeats this over all 87.5M pairs. Parallelising `pair_features` across PROCESSES (rapidfuzz threads segfault, same as blocking) is now the highest-leverage speedup for getting a CV at all.
 
 | Ver | Method | Sample | Recall ceiling | Entity cover | Avg cands / S1 | Runtime | Notes |
 |---|---|---|---|---|---|---|---|
