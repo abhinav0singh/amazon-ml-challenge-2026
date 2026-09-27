@@ -1,5 +1,9 @@
 # Approach Document: Business Entity Resolution
 
+> **SUPERSEDED.** This was the working draft. The finished methodology, with every
+> number filled in from the final run, is [`Documentation_template.md`](../Documentation_template.md)
+> in the repository root. Kept here for history.
+
 > Draft kept in sync with the code. The final version is copied into the organisers' `Documentation_template.md` (same headings) and zipped. Every number must come from `work/report.json` or `STATUS.md`. **[TBD]** = fill in from a real run.
 
 ## 1. Methodology used

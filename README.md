@@ -158,4 +158,37 @@ What this repository does have: a candidate generator with measured sub-linear s
 France gap it also predicted, a full-scale run that is reproducible from a clean clone, and a set
 of negative results that say precisely where the remaining loss lives.
 
-Built in 72 hours by a team of four, on a 16 GB laptop and rented compute.
+---
+
+## The team
+
+Four people, three days. Credited by what they carried, not by commit count.
+
+**Abhinav Singh** — Team lead. Pipeline architecture, the multi-key blocking redesign, the
+validation contract (locked folds, cross-fitted scoring, the noise-floor rule), the memory and
+scaling work, and every leaderboard upload.
+
+**Heeda Hurain Siddiqui** — Ran the 19.8-hour full-scale job on GCP that produced the submitted
+result, and handed back the validated output. Also wrote the France-focused normalisation tests
+and found the single-letter address mapping (`n` → `north`) that fires on 8.5% of Indian addresses
+but only 0.12% of French ones.
+
+**Anshika Mishra** — The methodology document, the packaging and pre-upload audit tooling, and
+the decision-layer evaluation harness. Also measured and then **rejected** the exact-key join:
+it looked like a clear win at 99.98% precision, and she proved on real out-of-fold data that
+every pair it found was already predicted — a no-op. That measurement stopped an untested change
+being pasted over a validated submission in the last hours.
+
+**Pragathi Kharvi** — Vectorised the pair-feature computation, independently reaching the same
+`rapidfuzz.cpdist` solution that landed on main, and correctly leaving the worker count at its
+default — the threaded path segfaults on this data.
+
+Built in 72 hours, on a 16 GB laptop and rented compute.
+
+---
+
+## Licence and data
+
+Code is MIT (see `LICENSE`). **The dataset is not ours and is not included** — it belongs to the
+challenge organisers, is excluded by `.gitignore`, and nothing in this repository reproduces it.
+The pipeline reads it from a path you supply.
