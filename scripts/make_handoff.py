@@ -28,6 +28,10 @@ _ap = argparse.ArgumentParser()
 _ap.add_argument("--out", default=os.path.join(ROOT, "output"))
 _ap.add_argument("--work", default=os.path.join(ROOT, "work"))
 _ap.add_argument("--dest", default=os.path.join(ROOT, "handoff"))
+_ap.add_argument("--allow-small", action="store_true",
+                 help="bundle a run that does not cover the whole test set (a mini-dataset "
+                      "dry run). The zip is named dryrun_* so it cannot be confused with a "
+                      "real handoff.")
 _args = _ap.parse_args()
 OUT, WORK = _args.out, _args.work
 FILES = [(os.path.join(OUT, "matching_results.tsv"), "matching_results.tsv"),
@@ -35,6 +39,7 @@ FILES = [(os.path.join(OUT, "matching_results.tsv"), "matching_results.tsv"),
          (os.path.join(OUT, "RUN_SUMMARY.txt"), "RUN_SUMMARY.txt"),
          (os.path.join(WORK, "report.json"), "report.json")]
 LOG = (os.path.join(WORK, "final_run.log"), "final_run.log")
+EXPECTED_TEST_S1 = 1_732_544   # rows in test_source1.tsv; AGENTS.md section 1
 
 
 def sha256(path):
@@ -54,6 +59,20 @@ def main():
         report = json.load(f)
     if "sample" in report:
         sys.exit("REFUSING: report.json is from a --sample smoke test, not a full run.")
+    # A mini-DATASET run (scripts/make_mini_dataset.py) is a genuine run on a small
+    # copy of the data, so it has no "sample" key and passes every check below. Its
+    # RUN_SUMMARY still says "FILES TO HAND TO P1 FOR UPLOAD" and still quotes a
+    # plausible-looking CV -- the 26 Sep dry run produced 0.9877, which sits right in
+    # the real leaderboard band. Nothing else distinguishes it from the real thing, so
+    # check the one fact that cannot be faked: the test set has EXPECTED_TEST_S1 rows.
+    n_test = (report.get("test") or {}).get("s1")
+    if not _args.allow_small and n_test is not None and n_test != EXPECTED_TEST_S1:
+        sys.exit(f"REFUSING: this run covers {n_test:,} test Source-1 entities, not the "
+                 f"{EXPECTED_TEST_S1:,} in the real test set, so it is a mini-dataset or "
+                 f"partial run and must never be uploaded. Its CV and LOCO numbers are "
+                 f"not comparable to a full run either.\n"
+                 f"If you are deliberately bundling a dry run, pass --allow-small; the zip "
+                 f"is then named dryrun_* so nobody can mistake it for the real one.")
     if "test" not in report or "output_check" not in report:
         sys.exit("REFUSING: report.json has no test/output_check section -- the run did not finish.")
     for name, want in report.get("output_sha256", {}).items():
@@ -65,7 +84,9 @@ def main():
         sys.exit(f"REFUSING: the official validator exited with code {rc}. Read final_run.log.")
 
     os.makedirs(_args.dest, exist_ok=True)
-    name = f"handoff_{report.get('git_commit', 'unknown')}_{time.strftime('%Y%m%d_%H%M')}.zip"
+    small = n_test is not None and n_test != EXPECTED_TEST_S1
+    prefix = "dryrun" if small else "handoff"
+    name = f"{prefix}_{report.get('git_commit', 'unknown')}_{time.strftime('%Y%m%d_%H%M')}.zip"
     dest = os.path.join(_args.dest, name)
     with zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as z:
         for src, arc in FILES + ([LOG] if os.path.exists(LOG[0]) else []):
@@ -73,6 +94,9 @@ def main():
     print(f"handoff ready: {dest} ({os.path.getsize(dest) / 1e6:.0f} MB)")
     print(f"CV (cross-fitted) = {report.get('cv_macro_f05_cross_fitted')}, "
           f"validator exit code = {rc}")
+    if small:
+        print(f"*** DRY RUN: {n_test:,} test entities, not {EXPECTED_TEST_S1:,}. Every score "
+              f"above is from a toy dataset and means NOTHING. Do not upload, do not quote. ***")
     if rc is None:
         print("NOTE: the official validator was not found on this machine -- P1 must run it "
               "before uploading.")
