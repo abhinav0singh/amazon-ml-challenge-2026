@@ -381,6 +381,41 @@ leakage would push CV *above* the leaderboard rather than below. What remains is
 France is 15.0 % of the test set and absent from training, and LOCO independently measures an unseen
 country at 0.9295 against 0.9491 in-distribution. The direction and rough size agree.
 
+### 2.7 Candidate-set efficiency
+
+Blocking is judged not only by what it keeps but by how little it keeps. A candidate set that is
+larger than it needs to be costs inference time at every later stage and, at Amazon's scale, is the
+difference between a feasible system and an infeasible one.
+
+The submitted run produced **70.6 candidates per Source 1 entity** (122,251,746 pairs over 1,732,544
+entities), capped at 80 and ranked by `cos_full + cos_addr`. We measured how much of that is actually
+load-bearing by re-ranking a full pair frame with the same score and truncating at each cap:
+
+| Cap | Candidates / S1 | True pairs retained (vs cap 80) |
+|---|---|---|
+| 80 (shipped) | 58.4 | 1.00000 |
+| 60 | 51.7 | 0.99965 |
+| 40 | 38.1 | 0.99840 |
+| 30 | 29.3 | 0.99703 |
+| 20 | 19.8 | 0.99369 |
+| 10 | 10.0 | 0.98342 |
+
+**Cap 20 discards two thirds of the candidate set and 0.63 % of the true pairs. Cap 30 halves it for
+0.30 %.** Those losses have to be read against the matcher, which already fails to rank 10 % of the
+true pairs it is given above the threshold (pair recall 0.9018). The candidates removed by a tighter
+cap are, overwhelmingly, ones the model was never going to select: of 122,251,746 candidates in the
+submitted run, only 5,579,264 ids — **4.6 %** — appear in any prediction.
+
+So the shipped cap of 80 is conservative, and deliberately so: it was chosen when the measured risk
+was losing recall, before the cost of a large candidate set was part of the evaluation. On this
+evidence a cap in the 20–30 range is the better operating point, and we record it here as the
+change we would make with more runway, rather than one we can claim to have measured end to end.
+
+**Caveat, stated rather than buried:** the table above comes from a 40,000-entity run, so its
+haystack is smaller than the real one and the cap binds less (58.4 candidates per entity against
+70.6 at full scale). At full scale a tighter cap would cut more, and would also cost somewhat more
+recall than shown. The direction is solid; the exact figures are not a full-scale measurement.
+
 ---
 
 ## 3. Model architecture and feature engineering
