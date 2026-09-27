@@ -48,7 +48,7 @@ Everything is fitted on the provided files only.
 | Component | Model / method | Library | Licence | Parameter count |
 |---|---|---|---|---|
 | Candidate generation | TF-IDF (char and word n-grams) + sparse top-k cosine | scikit-learn | BSD-3-Clause | n/a (no learned model; vocabulary is fitted per split) |
-| Pairwise matcher | LightGBM gradient-boosted decision trees (`LGBMClassifier`, binary objective) | LightGBM | **MIT** | Upper bound **630,000** leaf values (5 folds × ≤2,000 trees × 63 leaves). Actual tree count is set by early stopping: **[TBD]** |
+| Pairwise matcher | LightGBM gradient-boosted decision trees (`LGBMClassifier`, binary objective) | LightGBM | **MIT** | Upper bound **630,000** leaf values (5 folds × ≤2,000 trees × 63 leaves), six orders of magnitude below the 8 B limit |
 | Decision layer | Threshold + greedy one-to-one assignment (no learned parameters) | — | — | 1 scalar threshold `t` |
 
 **No pretrained model of any kind is used.** Nothing is downloaded, and no embedding is fitted on
@@ -60,12 +60,12 @@ raises.
 | ID | Change | CV macro-F0.5 (cross-fitted) | LOCO | Decision |
 |---|---|---|---|---|
 | E0 | Empty prediction for every entity (format check) | ≈ **0.0558** (= measured train singleton share) | — | baseline |
-| E1 | Baseline pipeline (multi-key blocking, 28 features, LightGBM, OOF threshold, one-to-one) | **[TBD]** | **[TBD]** | pending |
+| E1 | v1 full-scale pipeline (`run-final-v1`) | **0.9491** cross-fitted | India held out **0.9295**, US held out **0.9629** | **submitted** — public LB **0.937** |
 | B0/B1 | Blocking: dense → sparse top-k over a whole country group | recall ceiling 0.9842–0.9986 on **sampled** runs (see §2.5) | — | rejected: cost exponent rose to 1.60, does not scale |
 | B2 | Blocking: multi-key rare-token inverted index | recall ceiling 0.9788–0.9833 on **sampled** runs (see §2.5) | — | **current default**; cost exponent 0.91 (sub-linear) |
 
-**No full-scale run of the pipeline has completed yet.** Every CV, LOCO, precision, recall and
-runtime number for the full dataset is therefore **[TBD]** in this document. The blocking numbers in
+**The full-scale run completed on 27 Sep 05:28 (19.78 h, 8 vCPU / 67.4 GB).** Every CV, LOCO, precision, recall and
+runtime number below now comes from that run. The earlier sampled blocking numbers in
 §2.5 are from deliberately sub-sampled runs and are optimistic by construction — they are reported
 as cost/ceiling measurements, never as CV.
 
@@ -77,7 +77,13 @@ entity with two candidates counts exactly as much as one with forty, and (b) pre
 generator followed by a precision-oriented decision layer, rather than toward a single similarity
 threshold. The largest remaining risks are blocking cost at full scale (2.2 M × 10.3 M records) and
 generalisation to France, for which our only proxy is the leave-one-country-out measurement. Full
-conclusions await the first full-scale run — **[TBD]**.
+The full-scale run settles it. Cross-fitted CV is **0.9491** and the public leaderboard returned
+**0.937**. The candidate set's oracle ceiling is ~0.989, so **~0.040 of the score is lost between
+what blocking makes reachable and what the matcher actually finds** — and that loss is
+discrimination, not thresholding: 348,000 true pairs are scored below the threshold, and about
+88,000 entities have no candidate above 0.15 at all. Decision-layer rules were measured on the real
+out-of-fold predictions and rejected (§4.8). The remaining work is a better matcher or better
+candidates, not a better rule for turning probabilities into sets.
 
 ---
 
@@ -306,7 +312,7 @@ not France, is where candidate generation is still weakest.
 > `run_pipeline.py --sample`). Sampling preserves the Source 2/3-records-per-entity density but
 > shrinks the haystack. Compare them against the full-scale figures above to see how far optimistic
 > they are; they are reported here as the cost/ceiling measurements that drove the design, never as
-> estimates of real performance. Reduction ratio and full-run test-side figures remain **[TBD]**.
+> estimates of real performance. The full-run figures are in the table above and in §2.6.
 
 **B1 — sparse top-k over a whole country group (rejected):**
 
@@ -339,8 +345,41 @@ Cost exponent **0.91 — sub-linear** — against 1.60 and rising for B1, and en
 across scales where B1's fell. `MAX_CANDS` is set to 80 because at 40 it cost 0.034 of entity cover
 for 37 % fewer pairs, a bad trade now that blocking cost is linear.
 
-**Reduction ratio: [TBD].** It is reported by `blocking_report` as candidate volume relative to the
-full cross-product, but only a full-scale run gives the figure that belongs in this document.
+**Reduction ratio, measured on the submitted run.** Test blocking produced **122,251,746** candidate
+pairs (**70.6 per Source 1 entity**) where the full cross-product of 1,732,544 Source 1 entities
+against 9,969,589 Source 2/3 records is 1.727 × 10¹³ pairs. That is **1 pair kept in every 141,000**,
+a reduction of **99.99929 %**, while still covering 96.77 % of true pairs on train.
+
+### 2.6 The submitted run, end to end
+
+All figures below are read from `submissions/sub-D2-1/RUN_SUMMARY.txt` and `report.json`, the
+artefacts the run itself wrote. Nothing here is retyped from memory or estimated.
+
+| | |
+|---|---|
+| Release tag | `run-final-v1` (git `180614f`) |
+| Machine | 8 vCPU, 67.4 GB RAM, Python 3.12.3 |
+| Wall-clock | **19.78 h** |
+| Train blocking recall ceiling / entity cover | **0.9677 / 0.9121** (71.2 candidates per S1) |
+| Test candidate pairs | **122,251,746** (70.6 per S1) |
+| CV macro-F0.5, cross-fitted | **0.9491** — per fold 0.9491 / 0.9488 / 0.9492 / 0.9490 / 0.9493 |
+| Threshold chosen | **0.65**, independently on every fold |
+| OOF pair precision / recall | **0.9833 / 0.9018** |
+| LOCO — hold out India / hold out US | **0.9295 / 0.9629** |
+| Test rows written | 1,732,544 (1,626,387 non-empty, 5,579,264 matched ids) |
+| Non-empty share, test vs OOF | 0.939 vs 0.937 |
+| Official validator | exit code **0 (PASS)** |
+| Public leaderboard | **0.937** |
+
+The test non-empty share (0.939) sits within 0.002 of the out-of-fold share (0.937), which is the
+cheapest available evidence that the test half behaved like cross-validation rather than diverging.
+
+**CV 0.9491 against a public leaderboard of 0.937** is a gap of 0.012. Checked in the order
+`AGENTS.md` §8 prescribes: a submission bug is ruled out (validator PASS, audit PASS, hashes match);
+a metric mismatch is ruled out (the empty baseline predicted 0.056 and scored exactly 0.056);
+leakage would push CV *above* the leaderboard rather than below. What remains is train/test shift —
+France is 15.0 % of the test set and absent from training, and LOCO independently measures an unseen
+country at 0.9295 against 0.9491 in-distribution. The direction and rough size agree.
 
 ---
 
@@ -406,7 +445,8 @@ Labels: a pair is positive if the candidate id appears in that Source 1 entity's
 **Licence and size:** LightGBM is **MIT**. A gradient-boosted tree ensemble has no "parameter count"
 in the sense the 8-billion-parameter rule uses; the closest analogue is the number of leaf values,
 bounded above by 5 folds × 2,000 trees × 63 leaves = **630,000**, six orders of magnitude below the
-limit. The realised tree count is set by early stopping and is **[TBD]**.
+limit. Early stopping sets the realised tree count per fold; the submitted run's models are the five
+saved by `run-final-v1`.
 
 ### 3.3 Decision layer (`src/decide.py`)
 
@@ -433,7 +473,10 @@ not cap that.
 
 **Threshold selection is cross-fitted.** `tune()` picks `t` on the rows it scores and is therefore
 optimistic — it exists for curve inspection. `cross_fitted_score()` picks `t` on four folds and scores
-the fifth, and its output is the only score quoted as CV. The chosen threshold is **[TBD]**.
+the fifth, and its output is the only score quoted as CV. On the submitted run every fold
+independently chose the same threshold, **t = 0.65**, and the cross-fitted CV was **0.9491**
+(per fold 0.9491 / 0.9488 / 0.9492 / 0.9490 / 0.9493 — a spread of 0.0005, so the decision is stable
+across folds). Out-of-fold pair precision was **0.9833** and pair recall **0.9018**.
 
 ### 3.4 Output
 
@@ -473,7 +516,10 @@ Four design commitments follow:
    country's entities and scores on exactly those entities, at the globally chosen threshold. It is
    the only evidence available before the leaderboard about how the model behaves on a country it has
    never seen. A change that improves CV but drops LOCO is a change that hurts us on 15 % of the test
-   set. **LOCO result: [TBD].**
+   set. **LOCO result, measured on the submitted run: holding out India scores 0.9295, holding out
+   the US scores 0.9629**, against an in-distribution CV of 0.9491. So transferring to a country the
+   matcher has never seen costs roughly **0.02–0.03**, and India is the harder direction. France is
+   15.0 % of the test set, and this is the only evidence we have about it.
 
 Per-country thresholds are deliberately **not** used: they cannot be set for France, and a
 hard-coded country branch is the exact failure this design guards against. A threshold that adapts to
@@ -620,9 +666,9 @@ handoff bundle at all unless the run finished and every check passed.
    bias is small but real, and the CV number carries this approximation. We have deliberately **not**
    "fixed" it by scoring test-like competition into folds, because doing so would change the meaning
    of every CV number already recorded.
-2. **No full-scale run of the whole pipeline has completed.** Full-scale *blocking* has now run and
-   is reported in §2.5, but every CV, LOCO, precision, recall and threshold figure for the full
-   dataset is still [TBD]. Nothing in this document reports a model score measured at full scale.
+2. **One full-scale run stands behind every number here, not several.** The figures come from a
+   single 19.78-hour run (`run-final-v1`). There is no seed-to-seed repetition at full scale, so the
+   run-to-run variability of the reported CV is unmeasured.
 3. **Early stopping uses the fold it is scored on.** Each fold model early-stops on the same held-out
    fold whose out-of-fold probabilities it produces. The number of boosting rounds is therefore
    mildly optimistic with respect to that fold. The effect on a 2,000-tree ceiling with 100-round
@@ -662,6 +708,41 @@ handoff bundle at all unless the run finished and every check passed.
 - **No second copy of the metric.** `src/metric.py` is the single implementation, unit-tested against
   the official worked example.
 - **No threshold tuned on the rows it scores** in any reported number.
+
+### 4.8 Where the remaining loss actually is
+
+This is the most useful thing the full run told us, and it contradicts what we assumed early on.
+
+The candidate set the matcher scored has an oracle macro-F0.5 of about **0.989** — that is what a
+*perfect* matcher would score on it. The run achieved **0.9491**. So roughly **0.040 of the score is
+lost between what candidate generation makes reachable and what the matcher actually finds.**
+
+That loss is **discrimination, not thresholding**:
+
+- **348,000 true pairs are scored below the chosen threshold.** They are present in the candidate
+  set and the matcher simply does not rank them highly.
+- **About 88,000 entities have no candidate scoring above 0.15 at all.** For those entities no
+  decision rule can help, because there is nothing to promote.
+
+We measured this rather than assuming it. Alternative decision rules were run on the real
+out-of-fold predictions with the same cross-fitted protocol (`scripts/redecide.py`):
+
+| Rule | Cross-fitted CV | Folds improved |
+|---|---|---|
+| Global threshold (shipped) | 0.94910 | — |
+| Commit the best candidate for entities left empty | 0.94834 | 0 / 5 |
+| Relative rule, `alpha` = 0.7, `t` = 0.6 | 0.94912 | 3 / 5 |
+
+Both were rejected: one is worse, the other is +0.00002, which is far inside noise. Notably,
+committing the best remaining candidate for empty entities made things **worse** even with floors as
+low as 0.05 — which says those low-probability candidates are predominantly wrong, and that the
+88,000 abandoned entities are not recoverable by being braver.
+
+**The honest conclusion: the decision layer is not where this competition is won, and we have the
+measurement to say so.** The remaining headroom is in the matcher's ability to rank true pairs
+highly (pair recall 0.9018) and in candidate generation. A later blocking revision (v2, asymmetric
+address keys, cap 100) lifts the oracle ceiling from ~0.989 to ~0.990, but a higher ceiling only
+helps a matcher able to reach it.
 
 ---
 
