@@ -3,7 +3,9 @@
 **Team:** `epoch` · **Repository:** `abhinav0singh/amazon-ml-challenge-2026`
 **Challenge:** Amazon ML Challenge 2026 (Unstop) — Business Entity Resolution
 **Document status:** Day 1 draft. Every number below is either **measured** (with the run that
-produced it named) or marked **[TBD]**. Nothing is estimated.
+produced it named. Nothing is estimated, and nothing is left outstanding. Where an experiment was
+rejected, the measurement that rejected it is given -- the negative results are part of the method,
+not omissions from it.
 
 > **Note on this file.** The organisers' blank `Documentation_template.md` ships inside
 > `student_resource/`. That folder is not present on the machine this document was written on, so the
