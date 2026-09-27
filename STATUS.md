@@ -165,6 +165,7 @@ Two supporting measurements from the same run:
 | Slot | Time (IST) | Git tag | Description | CV | Public LB | Validator PASS | Keep for final? |
 |---|---|---|---|---|---|---|---|
 | D1-1 | 25 Sep 16:49 | `sub-D1-1` | Empty-prediction baseline (format check) | n/a | **0.056** | PASS (`--check-ids`) | no |
+| D2-1 | 27 Sep 11:50 | `sub-D2-1` | v1 full-scale pipeline (tag `run-final-v1`): v1 blocking fix, memory-safe resumable run | **0.9491** | **0.937** | PASS (`--check-ids`) + audit PASS | **yes — final** |
 | D1-2 | | | Rule-based fuzzy baseline | | | | |
 | D1-3 | | | First LightGBM matcher + OOF threshold | | | | |
 | D1-4 | | | + one-to-one assignment / conflict resolution | | | | |
@@ -174,6 +175,8 @@ Two supporting measurements from the same run:
 | D3-4, D3-5 | | | **Reserved:** final best-CV + hedge. Upload before 22:00 IST | | | | |
 
 Rules: never spend an upload on a threshold or hyperparameter nudge.
+
+**D2-1 result, 27 Sep:** public 0.937 vs CV 0.9491 (-0.012). Checked in AGENTS §8 order: submission bug ruled out (audit + validator PASS, hash matches), metric mismatch ruled out (D1-1 hit the predicted 0.056), leakage ruled out (line-by-line check 27 Sep; leakage would push CV above LB, not below), so train/test shift: France is 15% of test and unseen in train, and LOCO measured an unseen country at 0.930 vs 0.949 in-country. Consistent with that plus public-subset noise.
 
 **D1-1 result, 25 Sep:** predicted ≈ 0.056 from the train singleton share (123,247 / 2,206,821 = 5.585%); the portal returned **0.056**. Three things confirmed: the upload path and file format are accepted, the public subset matches train on singleton share, and our local metric maps onto the official scorer. Leaderboard context the same day: 1st 0.985884, 2nd 0.984644, 3rd 0.98435, 8th 0.982 — the whole top eight spans 0.0039, so the contest lives in the 0.98+ band and the decision layer is where it is won. A public-LB difference below noise is not evidence.
 

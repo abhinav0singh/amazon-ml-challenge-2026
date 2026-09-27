@@ -1,0 +1,6 @@
+sub-D2-1 -- uploaded 27 Sep 2026 11:50 IST -- public leaderboard 0.937
+code: tag run-final-v1 (commit 180614f), run on GCP n2-highmem-8 (8 vCPU / 67 GB)
+cross-fitted CV macro-F0.5 0.9491 (folds 0.9491 0.9488 0.9492 0.9490 0.9493); LOCO india 0.9295, us 0.9629
+matching_results.tsv  sha256 ee98702671b46e2d...  (full hash in RUN_SUMMARY.txt)
+The two TSVs (94 MB + ~1.6 GB) are too large for git; kept in C:\amlc\sub-D2-1\ and in the handoff zip in the GCS bucket.
+Pre-upload: scripts/audit_submission.py AUDIT PASS; organisers' validate_submission.py --check-ids PASS.
