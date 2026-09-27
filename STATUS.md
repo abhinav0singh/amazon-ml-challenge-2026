@@ -141,6 +141,8 @@ Chain branches all score `cos_name = 1.0`, so a max-rank ties them and the cap k
 | E2 | P4 | **V1** · per-entity set selection by approximate expected F0.5, k = 0 allowed (`decide.apply_expected_f05`) | **not measured** — no full run. *Sample 20k:* 0.9843 vs baseline 0.9840 | *Sample:* held-out India 0.9637, US 0.9917 (baseline 0.9635 / 0.9916) | *Sample LOCO-India:* 0.988 / 0.931 | **inconclusive** |
 | E3 | P4 | **V2** · relative rule — keep p ≥ α × the entity's own max p, above an absolute floor t (`decide.apply_relative_rule`) | **not measured** — no full run. *Sample 20k:* 0.9840 vs baseline 0.9840 | *Sample:* held-out India 0.9642, US 0.9913 | *Sample LOCO-India:* 0.989 / 0.929 | **inconclusive** |
 
+| E9 | P1 | **v2 full-scale run** (tag `run-final-v2b`, 256-core VM, completed 27 Sep 16:45) — asymmetric address keys, cap 100 | **cross-fitted CV 0.9489** — folds 0.9488/0.9487/0.9491/0.9491/0.9489, threshold 0.65 | LOCO India 0.9300, US 0.9624 | pair P 0.982 / R 0.903; **98.76 cands/S1 vs v1's 70.56 (+40%)**, 171,112,029 pairs; validator PASS | **REJECT — keep v1.** CV is 0.0002 *lower* (noise, not a gain) while the candidate set is 40% larger, which the organisers' 27 Sep notice says ranks lower. E5 measured v2's blocking oracle as clearly better (India 0.9864 vs 0.979), so v2 did put more true pairs in front of the matcher and **CV did not move** — direct evidence the binding constraint is scoring, not candidate generation. |
+
 **E2 / E3 notes (issue #3, P4).** Measured with `scripts/decide_eval.py` on a **20,000-entity sample**
 — development numbers only, never CV (AGENTS.md §4). Baseline sample cross-fitted score across model
 seeds 42/43/44: 0.9840 / 0.9843 / 0.9839 → **seed noise sd = 0.00021**, so the acceptance bar is a

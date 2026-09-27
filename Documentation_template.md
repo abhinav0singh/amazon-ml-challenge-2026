@@ -625,6 +625,34 @@ handoff bundle at all unless the run finished and every check passed.
 
 ### 4.6 Honest limitations
 
+**Where the loss actually is — measured, and not where we expected.** Decomposing all 7,638,365 true
+training pairs against the shipped run:
+
+| Fate of a true pair | Pairs | Share | Cause |
+|---|---|---|---|
+| Never became a candidate | 246,719 | 3.2% | blocking |
+| Candidate, scored p < 0.15 | 147,860 | 1.9% | matcher ranked it near zero |
+| Kept, but below t = 0.65 | 355,508 | 4.7% | threshold, which F0.5 forces high |
+| Predicted | 6,888,278 | 90.2% | — |
+
+Blocking is the **smallest** of the three causes. A perfect decision layer over the pairs the matcher
+kept would score **0.9814** against our **0.9500** on the same frame, so the headroom is in the
+ranking, not the cutoff.
+
+A second full-scale run (`run-final-v2b`) tested this directly: it widened candidate generation until
+the blocking oracle rose from 0.979 to 0.9864 on India, producing 40% more candidates per entity.
+**Cross-fitted CV moved from 0.9491 to 0.9489 — not at all.** More candidates did not help, because
+the matcher does not score them above threshold. We kept the smaller candidate set.
+
+**A structural blind spot we can name precisely.** Manual inspection of a 24-entity sample found the
+matcher scoring **0.000** on pairs such as `Creative Global Limited` ↔ `ક્રિએટિવ ગ્લોબલ લિમિટેડ`, and
+the same for Devanagari and Bengali renderings. Every string feature we use is a character n-gram or
+an edit distance, and a Gujarati string shares **no characters** with its Latin form, so all of them
+read approximately zero. Transliteration is invisible to this feature set by construction. A
+transliteration-aware feature — phonetic keying, or a script-normalising transliteration map built
+only from the provided files — is the single highest-value extension of this work.
+
+
 1. **One-to-one resolves within a fold during CV, but across all entities at test time.** The
    assignment step in `decide.py` de-duplicates candidates within whatever frame it is given. In
    cross-validation that frame is one fold, roughly a fifth of the entities, so it resolves less
