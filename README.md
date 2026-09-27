@@ -1,136 +1,161 @@
-# Amazon ML Challenge 2026 — Team Repo
+# Business Entity Resolution at 10M-record scale
 
-72-hour ML hackathon. Team of 4: Team Leader, Data Analyst, ML Engineer, 
-Monitor. This repo is our single source of truth — if it's not committed 
-here, it doesn't count as done.
+**Amazon ML Challenge 2026 · Team `epoch` · 72-hour hackathon**
 
-## Start here (everyone, before touching any code)
+Match business records across three noisy, unlinked data sources. For each of **1,732,544**
+Source-1 entities, find every Source-2/3 record describing the same real business — zero, one,
+or many — out of **9,969,589** candidates, with no shared keys and no ground truth for the test
+set.
 
-1. Read `prompts/master_prompt.md` and paste it into a fresh AI chat.
-2. It'll ask which role you are and for `docs/problem_formulation.md` — 
-   have that ready (Team Leader fills it in first, right after the problem 
-   drops).
-3. Once your AI session plays back a correct understanding of the metric, 
-   CV strategy, and your role, paste in your role prompt from `prompts/` 
-   and start working.
-
-Don't skip the master prompt, even if you're in a hurry — it's one extra 
-message and it's what stops four independent AI sessions from quietly 
-working off four different assumptions.
-
-## Repo structure
-
-```
-repo/
-├── README.md                    ← you are here
-├── requirements.txt              pinned deps — install with pip install -r requirements.txt
-├── src/
-│   ├── cv_folds.py               locked S1-entity folds -> work/folds.csv
-│   ├── pair_features.py / decide.py / run_pipeline.py / make_empty_submission.py
-│   ├── metric.py / data_io.py / normalize.py / blocking.py
-├── docs/
-│   ├── problem_formulation.md    filled by Team Leader, hour 0 — locked after that
-│   └── approach_document.md      REQUIRED official submission — see below, not internal notes
-├── prompts/                      one AI prompt per role, paste into your own chat session
-│   ├── master_prompt.md          run this FIRST, always
-│   ├── team_leader_prompt.md
-│   ├── data_analyst_prompt.md
-│   ├── ml_engineer_prompt.md
-│   ├── monitor_prompt.md
-│   └── validation_lead_prompt.md optional 5th role if we split it out
-├── notebooks/                    EDA and scratch work
-├── data/                         gitignored — see "Getting the data" below
-├── models/                       saved model artifacts
-└── submissions/                  every submission CSV, versioned — never overwrite one
-```
-
-## Non-negotiable rules
-
-- **CV folds are locked once, in `src/cv_folds.py`, right after 
-  `docs/problem_formulation.md` is filled.** Everyone imports the saved 
-  fold indices from there. Nobody regenerates folds independently — 
-  inconsistent folds across teammates silently breaks stacking later.
-- **No leakage.** Any scaler, encoder, or imputer gets fit on training-fold 
-  data only, never the full dataset before splitting. `src/features.py` has 
-  fold-safe patterns built in — use them.
-- **Trust local CV over the public leaderboard.** The public leaderboard 
-  only scores a fraction of the test set. A private leaderboard, scored on 
-  the full test set, decides real placement. Chasing small public-board 
-  bumps at the cost of local CV is how teams get blindsided.
-- **`docs/approach_document.md` is a required, scored submission**, not 
-  internal notes — per the official rules, Top 10 selection depends on the 
-  leaderboard result AND this document. Update it incrementally through the 
-  72 hours, not in the last exhausted hour.
-- **Every submission gets versioned** in `submissions/` with local CV score 
-  noted — this is what lets us roll back if something breaks near the 
-  deadline.
-- **Fixed random seeds, pinned `requirements.txt`, from commit one.** We 
-  need to be able to reproduce our best submission in the final 2 hours, 
-  not scramble for it.
-
-## Getting the data
-
-```bash
-pip install -r requirements.txt
-```
-
-Data is gitignored — download it from the competition portal into `data/` 
-locally. Do not commit raw data to the repo.
-
-## Workflow during the 72 hours
-
-1. Team Leader fills `docs/problem_formulation.md` and locks it.
-2. Team Leader or Validation Lead runs `src/cv_folds.py` once, commits the 
-   saved fold indices.
-3. Data Analyst builds features in `src/features.py`, respecting the locked 
-   folds, hands off to ML Engineer via the repo (push + a short ping, not a 
-   verbal explanation).
-4. ML Engineer builds models, runs error analysis, ensembles if time 
-   allows, saves submissions with version numbers.
-5. Monitor keeps `STATUS.md` (create this once work starts) updated every 
-   6-8 hours — who's doing what, what's blocked, are we on pace.
-6. Everyone contributes to `docs/approach_document.md` as their piece lands — 
-   validation approach after step 1-2, features after step 3, modeling and 
-   error analysis after step 4.
-
-## Git workflow
-
-One branch per person, frequent small commits, merge to `main` fast (a 
-self-merge + a chat ping beats waiting on formal review — we don't have 
-review-cycle time to spare). Never let a long-lived branch sit unmerged for 
-more than a few hours.
-
-## Timeline (from the official guidelines PDF, 25 Sep 2026)
-
-| When | What |
+| | |
 |---|---|
-| **25 Sep 12:00 AM IST** | Challenge window opens; problem and data released |
-| Each day | **Max 5 leaderboard uploads/day** (15 total). Only the Team Leader uploads, from one device |
-| **27 Sep 11:59 PM IST** | Challenge closes. Plan the final uploads by **22:00 IST** and the zip by **23:00 IST** |
-| After close | Top **100** announced (private + public LB + artefacts), then documents requested |
+| **Final score** | **0.9491** cross-fitted CV · **0.937** public leaderboard |
+| Baseline (predict nothing) | 0.0558 |
+| Search space reduced | **1 in 141,288** — 70.56 candidates scored per entity, not 9,969,589 |
+| Blocking cost growth | **0.91 exponent — sub-linear in corpus size** |
+| Data | 2.2M × 10.3M train pairs · 1.7M × 10.0M test · 2.3 GB |
+| Full pipeline runtime | 19.8 h on 8 vCPU / 67 GB |
 
-> The earlier version of this table (close "Sep 27 ~12:29 AM IST", "Top 50/Top 10") came from an old blog post and contradicts the official PDF. Confirm via the organisers' Google Form; until then we keep a submittable best version ready at all times.
+Scored by **F0.5 per entity, macro-averaged** — precision weighted 2× recall, and an entity with
+no true matches scores 1.0 only if you correctly predict nothing.
 
-## Run the pipeline (Business Entity Resolution)
+---
 
-```bash
-pip install -r requirements.txt
-# put the organisers' student_resource/ folder at data/ -> data/dataset/{train,test}, data/utils/
-python src/metric.py                                   # metric self-test (0.714)
-python src/make_empty_submission.py --data data/dataset --out output_empty   # upload D1-1
-python src/run_pipeline.py --data data/dataset --out output --work work --loco
-python data/utils/validate_submission.py --matching output/matching_results.tsv \
-       --candidate output/candidate_pairs.tsv --test-dir data/dataset/test
+## The interesting part: where the score actually goes
+
+Most write-ups list what worked. The useful finding here came from measuring what *didn't*.
+
+We decomposed all **7,638,365** true training pairs against the shipped model:
+
+| Fate of a true pair | Pairs | Share | Cause |
+|---|---|---|---|
+| Never became a candidate | 246,719 | 3.2% | blocking |
+| Candidate, scored p < 0.15 | 147,860 | 1.9% | matcher ranked it near zero |
+| Kept, but below the threshold | 355,508 | 4.7% | F0.5 forces a high cutoff |
+| Correctly predicted | 6,888,278 | 90.2% | — |
+
+**Blocking was the smallest of the three causes**, which contradicted our working hypothesis all
+the way to hour 65. A perfect decision layer over the pairs the matcher already kept would score
+**0.9814** against our **0.9500** on the same frame — so the headroom was in the *ranking*, not
+the cutoff.
+
+We tested that directly with a second full-scale run: widen candidate generation until the
+blocking oracle rises (India 0.979 → 0.9864), producing 40% more candidates per entity.
+**Cross-fitted CV moved from 0.9491 to 0.9489 — not at all.** More candidates did not help,
+because the matcher does not score them above threshold. We kept the smaller candidate set.
+
+**A named blind spot.** Inspecting a 24-entity sample by hand found the matcher scoring **0.000**
+on pairs like `Creative Global Limited` ↔ `ક્રિએટિવ ગ્લોબલ લિમિટેડ`, and the same for Devanagari and
+Bengali. Every string feature we use is a character n-gram or an edit distance, and a Gujarati
+string shares **no characters** with its Latin form — so all of them read zero. Transliteration is
+invisible to this feature set *by construction*. That is the single highest-value extension of
+this work, and we can say exactly why.
+
+---
+
+## Approach
+
+**normalise → block → pairwise classify → set-level decision**
+
+**Candidate generation** is the part that has to scale, so it got the most attention. Rather than
+rank each entity against its whole country group — which measured a **1.60 cost exponent, rising**,
+with coverage *falling* as the corpus grew — records are indexed under several complementary keys:
+their 3 rarest name tokens, 2 rarest address tokens, a name prefix, and a postal key. A true match
+survives if it shares *any one* of them, so the schemes fail independently: rare tokens survive
+reordering and suffix noise, the prefix survives a mangled interior, the address key survives a
+renamed business.
+
+Exact whole-name keys were tried first and scored 0.879 recall — any single typo breaks the whole
+key, and typos are what this dataset is made of. Rare-token indexing lifted that to 0.979.
+
+Three TF-IDF cosine views (char n-grams on name, on name+address, word n-grams on address) rerank
+*inside* each block, fitted once per country group so scores stay comparable.
+
+**Matcher:** LightGBM over 28 similarity and context features — string distances, TF-IDF cosines,
+postal/number agreement, and each candidate's rank among its entity's alternatives.
+
+**Decision layer:** threshold tuned for macro-F0.5 on out-of-fold predictions, plus one-to-one
+assignment. Training data confirmed *exactly zero* Source-2/3 records belong to two entities
+across all 7.6M pairs, so the constraint is hard rather than approximate.
+
+---
+
+## Engineering
+
+The pipeline had to run on a 16 GB laptop before it ever saw a cloud VM. Four things made that
+possible, each found by measurement after a run died:
+
+**Memory: 5.4 GB → 0.35 GB.** Normalisation gave every record a Python `set` for postal codes and
+another for address numbers. At ~216 bytes per empty set that is 5.4 GB across 12.5M records —
+enough to exhaust the machine before blocking started. Packed as flat int64 arrays plus offsets:
+0.35 GB.
+
+**An int32 overflow that killed a 2h15m run.** Attaching cosines to candidates fancy-indexed one
+sparse row *per pair* — billions of non-zeros, past SciPy's int32 index limit, surfacing as
+`negative dimensions are not allowed`. Sampled runs never reached it because 40k entities produce
+a thousand times fewer pairs. Fixed with density-derived chunking and a regression test that pins
+the property rather than the symptom.
+
+**Non-determinism in blocking.** Identical runs produced 38,319 / 38,325 / 38,331 candidate pairs.
+Rare-token selection broke frequency ties by `set` iteration order, which varies with Python's
+string hash randomisation. Every before/after comparison was meaningless until it was fixed.
+
+**Streaming throughout.** Country groups processed one at a time and spilled to parquet, records
+addressed by integer position, features computed in chunks and discarded after prediction, and
+pairs below the threshold grid's floor dropped at prediction time — which removes 82% of them.
+
+---
+
+## Validation discipline
+
+- **Folds locked and committed** — 5 folds, seed 42, grouped by Source-1 entity, so all of an
+  entity's pairs stay together. Committed to git so every number anyone quoted stays comparable.
+- **Cross-fitted scoring only.** The threshold is chosen on four folds and scored on the fifth.
+  The threshold-optimised number is never reported as CV.
+- **A measured noise floor.** Changes are accepted only above 2× the seed-to-seed standard
+  deviation *and* on ≥4 of 5 folds. Several promising ideas were rejected by this rule.
+- **Leave-one-country-out** as the only available proxy for France, which is 15% of the test set
+  and absent from training. It predicted the CV-to-leaderboard gap almost exactly.
+
+Experiments that were tested and **rejected** are logged with the numbers that rejected them —
+decision-layer rules (below the noise floor), an exact-key join (a no-op: the pairs it found were
+already predicted), and wider candidate generation (no CV movement). The negative results localise
+the remaining loss, which is why they are kept.
+
+---
+
+## Repository
+
 ```
-Outputs: `output/matching_results.tsv` (upload this), `output/candidate_pairs.tsv`, and `work/report.json` (blocking recall, CV, LOCO; copy these numbers into `STATUS.md`).
-Versioning: copy each uploaded `output/` into `submissions/<tag>/` and `git tag <tag>`. The old `submissions/*.csv` placeholders are empty and the wrong format (the portal needs `.tsv`), so delete them.
+src/          pipeline: normalize, blocking, pair_features, decide, metric, cv_folds, run_pipeline
+scripts/      packaging, auditing, blocking diagnostics, decision-layer evaluation
+docs/         RUN_FINAL.md (how to run at scale), COMPLIANCE_AUDIT.md (rules audit)
+tests/        normalisation and blocking regression tests
+Documentation_template.md   full methodology write-up
+STATUS.md     experiment log, submission ledger, measured data facts
+AGENTS.md     the team contract — metric, locked folds, ownership, hard rules
+```
 
-## Setup checklist (do this before the clock starts)
+**Reproduce:**
+```bash
+py -3.12 -m venv .venv && .venv/Scripts/python -m pip install -r requirements.txt
+.venv/Scripts/python src/metric.py                       # must print: metric OK
+.venv/Scripts/python src/run_pipeline.py --data <DATA> --out output --work work --loco
+```
+Needs ≥32 GB RAM. `docs/RUN_FINAL.md` has the full procedure and stage timings. The pipeline is
+resumable — each stage caches against a signature of the code, data and settings.
 
-- [ ] Everyone has repo access
-- [ ] Everyone has run `prompts/master_prompt.md` and confirmed their role
-- [ ] AWS Builder Center profile created + Student Rewards verified (all 4 — 
-  see the AWS prep blog's action plan)
-- [ ] `pip install -r requirements.txt` runs clean for everyone
-- [ ] Group chat channel confirmed (GitHub = code/record, chat = fast 
-  coordination — don't use one for the other's job)
+---
+
+## Honest assessment
+
+We finished well outside the leading cluster, which sat at 0.991. That gap is not thresholding or
+tuning — it is **355,508 true pairs our matcher ranks below false positives**, and the
+transliteration finding above explains a real share of them.
+
+What this repository does have: a candidate generator with measured sub-linear scaling and a
+141,288× reduction ratio, a validation setup whose CV predicted the leaderboard to within the
+France gap it also predicted, a full-scale run that is reproducible from a clean clone, and a set
+of negative results that say precisely where the remaining loss lives.
+
+Built in 72 hours by a team of four, on a 16 GB laptop and rented compute.
