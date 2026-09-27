@@ -57,7 +57,7 @@ from decide import apply_rule, check_one_to_one, cross_fitted_score, tune  # noq
 from metric import macro_f05, precision_recall  # noqa: E402
 from normalize import add_normalized_columns  # noqa: E402
 from pair_features import (CONTEXT_FEATURES, FEATURES, STRING_FEATURES,  # noqa: E402
-                           add_context_features, prepare_side, string_features)
+                           add_context_features, prepare_side, set_proc_workers, string_features)
 
 SEED = 42
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -1026,12 +1026,19 @@ def main():
                     help="blocking parallelism across country groups, using PROCESSES "
                          "(threads segfault rapidfuzz). 1 = serial (default). The count is "
                          "capped by group count and free RAM; see _plan_block_workers.")
+    ap.add_argument("--feature-workers", type=int, default=1, metavar="N",
+                    help="PROCESS parallelism for the string-feature stage, the hottest "
+                         "part of every run. 1 = serial (previous behaviour). Uses fork, "
+                         "so the side arrays are shared copy-on-write; no effect on "
+                         "Windows, which has no fork. Threads are not an option here: "
+                         "rapidfuzz's threaded cpdist segfaults on this data.")
     ap.add_argument("--fresh", action="store_true",
                     help="ignore saved stages and recompute everything (default: resume "
                          "any stage whose saved outputs match the current code and data)")
     ap.add_argument("--log", default=None,
                     help="also append everything printed (including tracebacks) to this file")
     args = ap.parse_args()
+    set_proc_workers(args.feature_workers)
     if args.log:
         _tee_output(args.log)
     os.makedirs(args.work, exist_ok=True)

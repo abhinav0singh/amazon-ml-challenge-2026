@@ -135,8 +135,57 @@ def add_context_features(cand: pd.DataFrame, b_is_s3: np.ndarray, ib: np.ndarray
     return cand
 
 
+# Process-level parallelism for the string-feature stage. This is the single
+# hottest thing in the pipeline -- every full run spends most of its wall-clock
+# here -- and it was pinned to one core, so a 256-core machine ran it on one.
+#
+# Processes, not threads: rapidfuzz 3.9.6's threaded cpdist segfaults on this
+# data (Windows access violation, reproducible at 60k real pairs). And fork, not
+# spawn: the side dicts hold hundreds of MB of numpy arrays, which fork shares
+# copy-on-write and spawn would pickle per task. On Windows there is no fork, so
+# this degrades to the serial path rather than silently pickling.
+PROC_WORKERS = 1
+_MIN_PARALLEL = 200_000     # below this the fork overhead outweighs the work
+_SHARED = None              # set in the parent before forking; children inherit
+
+
+def set_proc_workers(n: int) -> None:
+    """Set the worker count for the string-feature stage (1 = serial)."""
+    global PROC_WORKERS
+    PROC_WORKERS = max(1, int(n))
+
+
+def _feature_shard(bounds):
+    """Child side: compute one slice from the inherited arrays."""
+    s, e = bounds
+    ia, ib, a, b = _SHARED
+    return _string_features_serial(ia[s:e], ib[s:e], a, b)
+
+
 def string_features(ia: np.ndarray, ib: np.ndarray, a: dict, b: dict,
                     workers: int = 1) -> np.ndarray:
+    """The 16 string features for aligned pairs, parallel when configured."""
+    n = len(ia)
+    if PROC_WORKERS <= 1 or n < _MIN_PARALLEL or not hasattr(os, "fork"):
+        return _string_features_serial(ia, ib, a, b, workers)
+    import multiprocessing as mp
+    global _SHARED
+    _SHARED = (ia, ib, a, b)
+    step = max(1, -(-n // PROC_WORKERS))
+    bounds = [(s, min(s + step, n)) for s in range(0, n, step)]
+    try:
+        with mp.get_context("fork").Pool(len(bounds)) as pool:
+            parts = pool.map(_feature_shard, bounds)
+        return np.vstack(parts)
+    except Exception:
+        # A pool failure must never lose the run; fall back and keep going.
+        return _string_features_serial(ia, ib, a, b, workers)
+    finally:
+        _SHARED = None
+
+
+def _string_features_serial(ia: np.ndarray, ib: np.ndarray, a: dict, b: dict,
+                            workers: int = 1) -> np.ndarray:
     # workers=1 is deliberate. rapidfuzz 3.9.6's multi-threaded cpdist crashes
     # with a Windows access violation on this data (reproducible at 60k pairs;
     # it survives small toy inputs, which is why it is easy to miss). Single
