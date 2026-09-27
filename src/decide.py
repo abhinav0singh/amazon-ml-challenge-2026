@@ -148,6 +148,13 @@ def apply_expected_f05(pairs: pd.DataFrame, floor: float = 0.0,
     `floor` drops candidates below a probability before selection, which both
     saves work and keeps a long tail of near-zero candidates out of the |truth|
     estimate. `floor = 0.0` considers every candidate.
+
+    Implementation note: built from integer codes and one lexsort, with no pandas
+    group-by anywhere. The group-by version of this function cost ~86 s per call
+    on a full-scale out-of-fold frame (9M pairs, 2.2M entities) -- the same trap
+    `_as_sets` hit -- and `cross_fitted_rule` makes one call per grid point per
+    fold. `tests/test_decide_expected_f05.py` checks this against a plain
+    per-entity Python reference.
     """
     df = pairs[pairs["p"] >= floor] if floor > 0 else pairs
     if not len(df):
@@ -155,24 +162,44 @@ def apply_expected_f05(pairs: pd.DataFrame, floor: float = 0.0,
     if one_to_one:
         df = _award_to_best_s1(df)
 
-    df = df.sort_values(["s1_id", "p"], ascending=[True, False])
-    g = df.groupby("s1_id", sort=False)["p"]
-    k = g.cumcount().to_numpy() + 1                      # 1-based rank within entity
-    e_tp = g.cumsum().to_numpy()                         # E[TP] for the top-k set
-    e_truth = g.transform("sum").to_numpy()              # E[|truth|] for the entity
+    codes, _ = pd.factorize(df["s1_id"].astype(object).to_numpy())
+    p = df["p"].to_numpy(dtype=np.float64)
+    ids = df["s1_id"].astype(object).to_numpy()
+    cands = df["cand_id"].astype(object).to_numpy()
+
+    order = np.lexsort((-p, codes))                 # by entity, then p descending
+    codes, p, ids, cands = codes[order], p[order], ids[order], cands[order]
+    n = len(p)
+    starts = np.flatnonzero(np.r_[True, codes[1:] != codes[:-1]])
+    sizes = np.diff(np.r_[starts, n])
+    rep = np.repeat(starts, sizes)                  # each row -> its group's start
+
+    k = np.arange(n) - rep + 1                      # 1-based rank within the entity
+    csum = np.cumsum(p)
+    offset = np.repeat(csum[starts] - p[starts], sizes)
+    e_tp = csum - offset                            # E[TP] of this entity's top k
+    e_truth = np.repeat(csum[starts + sizes - 1] - (csum[starts] - p[starts]), sizes)
     f = 1.25 * e_tp / (0.25 * e_truth + k)
 
-    df = df.assign(_k=k, _f=f)
-    # Best k per entity, and the exact value of predicting nothing.
-    star = df.loc[df.groupby("s1_id", sort=False)["_f"].idxmax(), ["s1_id", "_k", "_f"]]
-    empty = np.exp(np.log1p(-df["p"].clip(upper=1 - 1e-12))
-                   .groupby(df["s1_id"], sort=False).sum())
-    star = star.set_index("s1_id")
-    commit = star["_f"] > empty.reindex(star.index)      # is any k >= 1 worth it?
-    keep_k = star["_k"].where(commit, 0)
+    gmax = np.maximum.reduceat(f, starts)           # best achievable per entity
+    # First k attaining that max (ties -> the smaller set, which is the safer bet
+    # under a precision-weighted metric).
+    at_max = f >= np.repeat(gmax, sizes) - 1e-12
+    pos = np.where(at_max, np.arange(n), n)
+    kstar = np.minimum.reduceat(pos, starts) - starts + 1
 
-    df = df[df["_k"] <= df["s1_id"].map(keep_k).to_numpy()]
-    return _as_sets(df)
+    # Exact value of predicting nothing: the entity is a true singleton with
+    # probability prod(1 - p), and an empty prediction then scores 1.0.
+    empty = np.exp(np.add.reduceat(np.log1p(-np.minimum(p, 1 - 1e-12)), starts))
+    kstar = np.where(gmax > empty, kstar, 0)
+
+    keep = k <= np.repeat(kstar, sizes)
+    if not keep.any():
+        return {}
+    ids, cands, codes = ids[keep], cands[keep], codes[keep]
+    starts = np.flatnonzero(np.r_[True, codes[1:] != codes[:-1]])
+    ends = np.r_[starts[1:], len(codes)]
+    return {ids[a]: set(cands[a:b].tolist()) for a, b in zip(starts, ends)}
 
 
 def apply_relative_rule(pairs: pd.DataFrame, t: float, alpha: float,
