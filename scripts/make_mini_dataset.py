@@ -30,6 +30,11 @@ import pandas as pd
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 from data_io import read_tsv  # noqa: E402
 
+# The organisers' files end lines with LF. pandas on Windows writes CRLF by
+# default, which a hand-rolled reader (e.g. the audit script) sees as a trailing
+# carriage return on the last column.
+LF = "\n"
+
 
 def filter_copy(src, dst, keep_ids, chunk=1_000_000):
     """Stream `src` and write only rows whose entity_id is in keep_ids."""
@@ -38,7 +43,7 @@ def filter_copy(src, dst, keep_ids, chunk=1_000_000):
                             chunksize=chunk):
         part = part[part["entity_id"].isin(keep_ids)]
         part.to_csv(dst, sep="\t", index=False, mode="w" if first else "a",
-                    header=first, quoting=3)
+                    header=first, quoting=3, lineterminator=LF)
         first = False
 
 
@@ -67,13 +72,13 @@ def main():
         s1 = read_tsv(os.path.join(d, f"{split}_source1.tsv"))
         keep = s1.iloc[np.sort(rng.choice(len(s1), size=min(n, len(s1)), replace=False))]
         keep.to_csv(os.path.join(args.dest, split, f"{split}_source1.tsv"), sep="\t",
-                    index=False, quoting=3)
+                    index=False, quoting=3, lineterminator=LF)
         wanted = set()
         if split == "train":
             gt = read_tsv(os.path.join(d, "train_ground_truth.tsv"))
             gt = gt[gt["source1_entity_id"].isin(set(keep["entity_id"]))]
             gt.to_csv(os.path.join(args.dest, split, "train_ground_truth.tsv"), sep="\t",
-                      index=False, quoting=3)
+                      index=False, quoting=3, lineterminator=LF)
             for m in gt["matched_entity_ids"]:
                 wanted |= {x.strip() for x in m.split(",") if x.strip()}
         pool = np.concatenate([ids_of(os.path.join(d, f"{split}_source{k}.tsv")) for k in (2, 3)])
