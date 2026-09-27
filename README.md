@@ -162,30 +162,85 @@ of negative results that say precisely where the remaining loss lives.
 
 ## The team
 
-Four people, three days. Credited by what they carried, not by commit count.
+Four people, three days. Credited by what they carried, not by commit count — the counts badly
+misrepresent this.
 
-**Abhinav Singh** — Team lead. Pipeline architecture, the multi-key blocking redesign, the
-validation contract (locked folds, cross-fitted scoring, the noise-floor rule), the memory and
+### Anshika Mishra — methodology, submission machinery, and the discipline that protected it
+
+The single largest body of work in this repository after the pipeline itself, across all three days.
+
+**She wrote the artefact that gets reviewed.** `Documentation_template.md` — 837 lines, every
+section, every number traced to a named run. When the organisers announced on the final day that
+candidate-set efficiency would count toward the ranking, she added §2.7 on it within hours.
+
+**She built everything that turns a result into a submission.** `make_package.py` (assembles the zip
+from an explicit allow-list, so no dataset or cache can leak in and it *refuses* to build from
+incomplete output), `audit_submission.py` (one-command pre-upload check), `make_handoff.py`, and
+`package_README.md` — the reproduction guide shipped inside the package. Without these there is no
+deliverable, only files.
+
+**She owns the decision layer** — `src/decide.py`, `decide_eval.py`, `redecide.py`, and 266 lines of
+tests for it.
+
+**And she produced three rigorous negative results, each of which saved us from a mistake:**
+
+- **E8 — the exact-key join.** A hash join on identical normalised name+address measured **99.98%
+  precision** on full train. It looked like a clear win and we were minutes from applying it to a
+  validated submission at hour 70. She tested it against real out-of-fold predictions first and
+  found **every single pair it produced was already predicted** — a no-op. Exact matches are the
+  *easy* cases the matcher already gets; precision on pairs you already have is worth nothing.
+- **E7 — probability calibration.** Tested, rejected, recorded.
+- **E6 correction.** She had reported a gain from `learn_k`, a model that decides how many candidates
+  each entity keeps. She then re-tested it on an independent sample, found **it did not replicate**,
+  and published the correction herself.
+
+Disproving your own result, unprompted, in the last hours of a competition, is the rarest thing on
+this list. She also caught a flaw in her own audit — *"check France in BOTH directions, not just
+collapse"* — and consistently flagged what she could **not** verify rather than papering over it.
+
+### Heeda Hurain Siddiqui — the run that produced everything we submitted
+
+**She ran the job.** 19.8 hours, 8 vCPU / 67 GB on GCP, at tag `run-final-v1` — the full-scale run
+that produced the cross-fitted CV of 0.9491, the LOCO numbers, and both output files we submitted.
+Every result quoted in this repository comes from that execution. It was the long pole of the
+entire competition, it had already failed three times on smaller machines, and when it finally ran
+it ran clean and she handed back a validated, hash-verified output.
+
+That work leaves almost no trace in the commit graph, which is exactly why it needs saying here: a
+19-hour run that has to be monitored, survive disconnection, and produce a byte-exact artefact is
+not a smaller contribution than the code it executes.
+
+**She also found a real bug by questioning an assumption nobody had.** `tests/test_normalize.py` —
+ten France-focused tests covering accent stripping, French legal forms (`SARL`, `SAS`, `SASU`,
+`EURL`), and the all-suffix fallback. While writing them she noticed `ADDR_MAP` expanded a bare
+`n` to `north`, which mangles French addresses like `Bat N`. Measured across 400k real test
+addresses it fires on **8.54% of Indian addresses against 0.12% of French** — so the rule mattered
+far more than anyone had assumed, in a country we had not been thinking about.
+
+### Pragathi Kharvi — feature vectorisation, and a convergent answer
+
+Vectorised the pair-feature computation (`p3-vectorize-pair-features`, 97 lines), replacing the
+per-pair Python loop with `rapidfuzz.process.cpdist`. She reached that solution **independently and
+in parallel** with the version that landed on main — and she got a detail right that cost the rest
+of us a crash to learn: she left the worker count at its default, where the threaded path segfaults
+on this data.
+
+Her branch was superseded only because a near-identical change merged first. That is a coordination
+failure on the team lead's part, not a reflection on the work — two people solving the same problem
+the same way, from opposite directions, was the strongest evidence we had that the approach was
+correct. The commit is preserved at tag `p3-vectorize-pair-features`.
+
+She also contributed to the cross-fitted decision-threshold evaluation.
+
+### Abhinav Singh — team lead
+
+Pipeline architecture, the multi-key blocking redesign (cost exponent 1.60 → 0.91), the validation
+contract — locked folds, cross-fitted scoring, the noise-floor acceptance rule — the memory and
 scaling work, and every leaderboard upload.
 
-**Heeda Hurain Siddiqui** — Ran the 19.8-hour full-scale job on GCP that produced the submitted
-result, and handed back the validated output. Also wrote the France-focused normalisation tests
-and found the single-letter address mapping (`n` → `north`) that fires on 8.5% of Indian addresses
-but only 0.12% of French ones.
-
-**Anshika Mishra** — The methodology document, the packaging and pre-upload audit tooling, and
-the decision-layer evaluation harness. Also measured and then **rejected** the exact-key join:
-it looked like a clear win at 99.98% precision, and she proved on real out-of-fold data that
-every pair it found was already predicted — a no-op. That measurement stopped an untested change
-being pasted over a validated submission in the last hours.
-
-**Pragathi Kharvi** — Vectorised the pair-feature computation, independently reaching the same
-`rapidfuzz.cpdist` solution that landed on main, and correctly leaving the worker count at its
-default — the threaded path segfaults on this data.
+---
 
 Built in 72 hours, on a 16 GB laptop and rented compute.
-
----
 
 ## Licence and data
 
