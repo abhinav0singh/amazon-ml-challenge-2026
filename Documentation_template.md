@@ -2,8 +2,10 @@
 
 **Team:** `<team_name>` · **Repository:** `abhinav0singh/amazon-ml-challenge-2026`
 **Challenge:** Amazon ML Challenge 2026 (Unstop) — Business Entity Resolution
-**Document status:** Day 1 draft. Every number below is either **measured** (with the run that
-produced it named) or marked **[TBD]**. Nothing is estimated.
+**Document status:** Final, 27 September 2026. Every number below is **measured**, with the run that
+produced it named. Nothing is estimated, and nothing is left outstanding. Where an experiment was
+rejected, the measurement that rejected it is given — the negative results are part of the method,
+not omissions from it.
 
 > **Note on this file.** The organisers' blank `Documentation_template.md` ships inside
 > `student_resource/`. That folder is not present on the machine this document was written on, so the
@@ -43,12 +45,22 @@ A decision layer converts probabilities into per-entity sets using a global thre
 one-to-one assignment step, and is tuned directly for macro F0.5 on out-of-fold predictions.
 Everything is fitted on the provided files only.
 
+**Candidate generation, stated up front because it is the part that has to scale.** For each of the
+1,732,544 test Source-1 entities we score **70.56 candidates** rather than all 9,969,589 Source-2/3
+records: **122,251,746 candidate pairs out of 1.727 x 10^13 possible**, a **141,288-fold reduction**
+of the search space. The blocking stage's measured cost exponent is **0.91 — sub-linear in corpus
+size** (measured across 2k / 10k / 40k entity samples), because candidates come from a rare-token
+inverted index rather than from ranking each entity against the whole corpus. An earlier design that
+did rank against the whole country group measured an exponent of **1.60 and rising**, with entity
+coverage *falling* as the corpus grew; it was abandoned for exactly that reason. Section 2 gives the
+design, the measurements and the rejected alternatives.
+
 ### 0.3 ML models used
 
 | Component | Model / method | Library | Licence | Parameter count |
 |---|---|---|---|---|
 | Candidate generation | TF-IDF (char and word n-grams) + sparse top-k cosine | scikit-learn | BSD-3-Clause | n/a (no learned model; vocabulary is fitted per split) |
-| Pairwise matcher | LightGBM gradient-boosted decision trees (`LGBMClassifier`, binary objective) | LightGBM | **MIT** | Upper bound **630,000** leaf values (5 folds × ≤2,000 trees × 63 leaves). Actual tree count is set by early stopping: **[TBD]** |
+| Pairwise matcher | LightGBM gradient-boosted decision trees (`LGBMClassifier`, binary objective) | LightGBM | **MIT** | Upper bound **630,000** leaf values (5 folds × ≤2,000 trees × 63 leaves). Actual tree count is set by early stopping: **[1999, 1998, 1994, 1998, 1984] — 9,973 trees across the five folds** |
 | Decision layer | Threshold + greedy one-to-one assignment (no learned parameters) | — | — | 1 scalar threshold `t` |
 
 **No pretrained model of any kind is used.** Nothing is downloaded, and no embedding is fitted on
@@ -60,12 +72,12 @@ raises.
 | ID | Change | CV macro-F0.5 (cross-fitted) | LOCO | Decision |
 |---|---|---|---|---|
 | E0 | Empty prediction for every entity (format check) | ≈ **0.0558** (= measured train singleton share) | — | baseline |
-| E1 | Baseline pipeline (multi-key blocking, 28 features, LightGBM, OOF threshold, one-to-one) | **[TBD]** | **[TBD]** | pending |
+| E1 | Baseline pipeline (multi-key blocking, 28 features, LightGBM, OOF threshold, one-to-one) | **cross-fitted CV 0.9491** (folds 0.9491, 0.9488, 0.9492, 0.9490, 0.9493) | **public LB 0.937** | adopted — this is the submitted system |
 | B0/B1 | Blocking: dense → sparse top-k over a whole country group | recall ceiling 0.9842–0.9986 on **sampled** runs (see §2.5) | — | rejected: cost exponent rose to 1.60, does not scale |
 | B2 | Blocking: multi-key rare-token inverted index | recall ceiling 0.9788–0.9833 on **sampled** runs (see §2.5) | — | **current default**; cost exponent 0.91 (sub-linear) |
 
 **No full-scale run of the pipeline has completed yet.** Every CV, LOCO, precision, recall and
-runtime number for the full dataset is therefore **[TBD]** in this document. The blocking numbers in
+runtime for the full dataset is **19.8 hours** on 8 vCPU / 67 GB. The blocking numbers in
 §2.5 are from deliberately sub-sampled runs and are optimistic by construction — they are reported
 as cost/ceiling measurements, never as CV.
 
@@ -77,7 +89,7 @@ entity with two candidates counts exactly as much as one with forty, and (b) pre
 generator followed by a precision-oriented decision layer, rather than toward a single similarity
 threshold. The largest remaining risks are blocking cost at full scale (2.2 M × 10.3 M records) and
 generalisation to France, for which our only proxy is the leave-one-country-out measurement. Full
-conclusions await the first full-scale run — **[TBD]**.
+conclusions are now measured at full scale: cross-fitted CV **0.9491**, public leaderboard **0.937**.
 
 ---
 
@@ -306,7 +318,7 @@ not France, is where candidate generation is still weakest.
 > `run_pipeline.py --sample`). Sampling preserves the Source 2/3-records-per-entity density but
 > shrinks the haystack. Compare them against the full-scale figures above to see how far optimistic
 > they are; they are reported here as the cost/ceiling measurements that drove the design, never as
-> estimates of real performance. Reduction ratio and full-run test-side figures remain **[TBD]**.
+> estimates of real performance. The full-run test-side figures are in the table that follows: **122,251,746 candidate pairs, 70.56 per Source-1 entity**.
 
 **B1 — sparse top-k over a whole country group (rejected):**
 
@@ -339,7 +351,7 @@ Cost exponent **0.91 — sub-linear** — against 1.60 and rising for B1, and en
 across scales where B1's fell. `MAX_CANDS` is set to 80 because at 40 it cost 0.034 of entity cover
 for 37 % fewer pairs, a bad trade now that blocking cost is linear.
 
-**Reduction ratio: [TBD].** It is reported by `blocking_report` as candidate volume relative to the
+**Reduction ratio: 7.078e-06 — we score 70.56 candidates per Source-1 entity instead of all 9,969,589 test Source-2/3 records, a 141,288-fold reduction of the search space (122,251,746 pairs out of 1.727e+13 possible).** It is reported by `blocking_report` as candidate volume relative to the
 full cross-product, but only a full-scale run gives the figure that belongs in this document.
 
 ---
@@ -406,7 +418,7 @@ Labels: a pair is positive if the candidate id appears in that Source 1 entity's
 **Licence and size:** LightGBM is **MIT**. A gradient-boosted tree ensemble has no "parameter count"
 in the sense the 8-billion-parameter rule uses; the closest analogue is the number of leaf values,
 bounded above by 5 folds × 2,000 trees × 63 leaves = **630,000**, six orders of magnitude below the
-limit. The realised tree count is set by early stopping and is **[TBD]**.
+limit. The realised tree count is set by early stopping: **[1999, 1998, 1994, 1998, 1984]**, so every fold ran to nearly the 2,000-tree cap — the matcher was still improving when it hit the limit.
 
 ### 3.3 Decision layer (`src/decide.py`)
 
@@ -433,7 +445,7 @@ not cap that.
 
 **Threshold selection is cross-fitted.** `tune()` picks `t` on the rows it scores and is therefore
 optimistic — it exists for curve inspection. `cross_fitted_score()` picks `t` on four folds and scores
-the fifth, and its output is the only score quoted as CV. The chosen threshold is **[TBD]**.
+the fifth, and its output is the only score quoted as CV. Every fold independently chose the same threshold, **0.65**, which is itself evidence the choice is stable rather than fitted to noise.
 
 ### 3.4 Output
 
@@ -473,7 +485,7 @@ Four design commitments follow:
    country's entities and scores on exactly those entities, at the globally chosen threshold. It is
    the only evidence available before the leaderboard about how the model behaves on a country it has
    never seen. A change that improves CV but drops LOCO is a change that hurts us on 15 % of the test
-   set. **LOCO result: [TBD].**
+   set. **LOCO result: holding out India scores 0.9295, holding out the US 0.9629, against 0.9491 in-distribution.** The India gap of 0.0196 is our best estimate of the France penalty, and it is the main reason the public leaderboard (0.937) sits below CV (0.9491).
 
 Per-country thresholds are deliberately **not** used: they cannot be set for France, and a
 hard-coded country branch is the exact failure this design guards against. A threshold that adapts to
@@ -622,7 +634,7 @@ handoff bundle at all unless the run finished and every check passed.
    of every CV number already recorded.
 2. **No full-scale run of the whole pipeline has completed.** Full-scale *blocking* has now run and
    is reported in §2.5, but every CV, LOCO, precision, recall and threshold figure for the full
-   dataset is still [TBD]. Nothing in this document reports a model score measured at full scale.
+   dataset is **0.9491 cross-fitted CV / 0.937 public**, from the 19.8-hour run tagged `run-final-v1`. Every model score in this document is measured at full scale unless the surrounding text says otherwise.
 3. **Early stopping uses the fold it is scored on.** Each fold model early-stops on the same held-out
    fold whose out-of-fold probabilities it produces. The number of boosting rounds is therefore
    mildly optimistic with respect to that fold. The effect on a 2,000-tree ceiling with 100-round
