@@ -36,7 +36,8 @@ EXPECTED_TEST_S1 = 1_732_544          # measured from test_source1.tsv, see AGEN
 M_HEADER = "source1_entity_id\tmatched_entity_ids"
 C_HEADER = "source1_entity_id\tcandidate_entity_ids"
 SHARE_GAP_LIMIT = 0.05                # test vs OOF non-empty share, per #22 part 4
-FRANCE_RATIO_LIMIT = 0.80             # France rate must be >= this x the weakest seen country
+FRANCE_LOW_LIMIT = 0.80    # France rate must be >= this x the weakest seen country
+FRANCE_HIGH_LIMIT = 1.30   # ... and <= this x the strongest, see the two-sided check below
 
 FAILURES: list[str] = []
 WARNINGS: list[str] = []
@@ -246,11 +247,28 @@ def main():
         check(False, "France present in the test set", "no France rows found", warn_only=True)
     else:
         others = [r for c, r in rates.items() if c != fr]
-        floor = FRANCE_RATIO_LIMIT * min(others) if others else 0.0
-        check(rates[fr] >= floor, "France prediction rate vs the other countries",
+        # Two-sided, because an unseen country can fail in either direction and the
+        # two failures look nothing alike:
+        #   too LOW  -> the model has no confidence on France and leaves entities
+        #               empty. Every non-singleton it abandons scores a flat 0.0.
+        #   too HIGH -> it is over-committing on a country it never trained on.
+        #               Those extra predictions are false merges, and F0.5 weights
+        #               precision twice, so this is not the safe direction either.
+        # Measured on a 40k sampled run (27 Sep): France 0.2694 vs US 0.1341 and
+        # India 0.1682 -- i.e. the HIGH side is the one that actually showed up,
+        # and a one-sided check would have passed it without a word.
+        floor = FRANCE_LOW_LIMIT * min(others) if others else 0.0
+        ceil_ = FRANCE_HIGH_LIMIT * max(others) if others else 1.0
+        check(rates[fr] >= floor, "France prediction rate not collapsed",
               f"France {rates[fr]:.4f}, weakest other {min(others):.4f} "
               f"-> floor {floor:.4f}. Below this means unseen-country collapse "
               f"on 15% of the test set")
+        check(rates[fr] <= ceil_, "France prediction rate not inflated",
+              f"France {rates[fr]:.4f}, strongest other {max(others):.4f} "
+              f"-> ceiling {ceil_:.4f}. Above this the model is over-committing on "
+              f"a country it never trained on, and every extra prediction is a "
+              f"false merge against a precision-weighted metric",
+              warn_only=True)
 
     print("\n" + "=" * 70)
     if FAILURES:
