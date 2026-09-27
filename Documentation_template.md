@@ -1,6 +1,6 @@
 # Business Entity Resolution Challenge — Methodology Document
 
-**Team:** `<team_name>` · **Repository:** `abhinav0singh/amazon-ml-challenge-2026`
+**Team:** `epoch` · **Repository:** `abhinav0singh/amazon-ml-challenge-2026`
 **Challenge:** Amazon ML Challenge 2026 (Unstop) — Business Entity Resolution
 **Document status:** Final, 27 September 2026. Every number below is **measured**, with the run that
 produced it named. Nothing is estimated, and nothing is left outstanding. Where an experiment was
