@@ -25,6 +25,9 @@ Rules:
                  prod(1 - p), the exact probability the entity is a true
                  singleton -- so the commit/stay-empty call is made from the
                  entity's own evidence rather than a global floor.
+  adaptive       threshold that rises with the entity's candidate count:
+                 t + beta*(log1p(n) - log1p(8)). More candidates means more
+                 chances to be wrong, and F0.5 weights precision twice.
 """
 from __future__ import annotations
 
@@ -40,8 +43,8 @@ import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 from data_io import load_truth, read_tsv, write_id_lists  # noqa: E402
-from decide import (apply_expected_f05, apply_relative_rule, apply_rule,  # noqa: E402
-                    cross_fitted_rule)
+from decide import (apply_adaptive_rule, apply_expected_f05,  # noqa: E402
+                    apply_relative_rule, apply_rule, cross_fitted_rule)
 from metric import precision_recall  # noqa: E402
 
 
@@ -115,6 +118,12 @@ def main():
         # floor applied before selection.
         "expected_f05": (lambda d, g: apply_expected_f05(d, g, True),
                          [0.0, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5]),
+        # Issue #3 task B: one global threshold treats an entity with 40 candidates
+        # like one with 2, though the first has far more chances to admit a false
+        # match. beta = 0 is in the grid and reproduces `threshold` exactly, so this
+        # can only win by actually scoring better.
+        "adaptive": (lambda d, g: apply_adaptive_rule(d, g[0], g[1], True),
+                     [(t, b) for t in (0.5, 0.6, 0.7) for b in (0.0, 0.03, 0.06, 0.12)]),
     }
     res = {}
     for name, (rule, grid) in candidates.items():

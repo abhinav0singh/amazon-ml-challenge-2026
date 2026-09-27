@@ -268,3 +268,49 @@ def cross_fitted_rule(pairs: pd.DataFrame, truth: dict, s1_fold: dict, rule, gri
         scores.append(macro_f05(rule(va, best), truth, va_ids))
         chosen.append(best)
     return float(np.mean(scores)), scores, chosen
+
+
+# Reference candidate count for the adaptive threshold. An entity with this many
+# candidates gets exactly the base threshold; fewer relaxes it, more tightens it.
+# 8 is the order of magnitude of a typical entity's candidate list, so the base
+# threshold stays interpretable as beta changes.
+ADAPTIVE_REF_CANDS = 8
+
+
+def apply_adaptive_rule(pairs: pd.DataFrame, t: float, beta: float,
+                        one_to_one: bool = True) -> dict:
+    """Threshold that rises with how many candidates the entity has.
+
+    Issue #3 task B: one global threshold treats an entity with 40 candidates
+    like one with 2, but the first has twenty times as many chances to admit a
+    false match, and F0.5 weights precision twice. So require more confidence
+    where there is more opportunity to be wrong, and less where there is little:
+
+        t_eff = t + beta * (log1p(n_cands) - log1p(ADAPTIVE_REF_CANDS))
+
+    `n_cands` is counted on the entity's FULL candidate list, before thresholding,
+    so it is known at inference time and does not depend on the threshold being
+    searched. The log keeps the adjustment gentle: between 2 and 40 candidates it
+    spans about 3 beta.
+
+    **beta = 0 reduces exactly to apply_rule at t**, which is what makes this safe
+    to put in a grid search -- the baseline is inside the family, so the search can
+    only pick something else if it actually scores better.
+
+    This adapts to a measured property of the entity, never to its country, so it
+    carries to France like every other rule here.
+    """
+    p = pairs["p"].to_numpy(dtype=np.float64)
+    if beta == 0.0:
+        keep = p >= t
+    else:
+        codes, _ = pd.factorize(pairs["s1_id"].astype(object).to_numpy())
+        n_cands = np.bincount(codes)[codes]
+        t_eff = t + beta * (np.log1p(n_cands) - np.log1p(ADAPTIVE_REF_CANDS))
+        keep = p >= t_eff
+    df = pairs[keep]
+    if not len(df):
+        return {}
+    if one_to_one:
+        df = _award_to_best_s1(df)
+    return _as_sets(df)
