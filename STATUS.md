@@ -214,7 +214,17 @@ Rules: never spend an upload on a threshold or hyperparameter nudge.
 
 ---
 
-## 9. Final package checklist (P1, Day 3 by 21:00 IST)
+## 9. Final package checklist (P1, Day 3)
+
+**Built 27 Sep 22:07 IST — `C:mlcmlc_team_submission.zip`, 708 MB, 15 entries, zip integrity OK.**
+
+- [x] `utils/validate_submission.py` → PASS on both files (`--check-ids`), recorded for D2-1
+- [x] Every ID in matching_results appears in candidate_pairs — 5,579,264 matched of 122,251,746 candidates
+- [x] Code reruns end to end from `README.md`; `requirements.txt` pinned to 8 packages, each annotated with its licence
+- [x] Model licences recorded — LightGBM MIT; numpy/pandas/scipy/scikit-learn BSD-3; rapidfuzz MIT; pyarrow Apache-2.0. **No pretrained model is used, so the 8B parameter limit is not approached**
+- [x] Functions commented; every module documents why, not only what
+- [x] `Documentation_template.md` filled — **zero [TBD] remaining**, every number traced to a named run
+- [x] Zip layout exactly as the problem statement specifies; contents are an allow-list, so no dataset, `work/`, cache or virtualenv can leak in
 
 - [ ] `utils/validate_submission.py` → PASS on both files
 - [ ] Every ID in matching_results is in candidate_pairs
