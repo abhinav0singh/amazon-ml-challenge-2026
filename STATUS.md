@@ -133,6 +133,8 @@ Chain branches all score `cos_name = 1.0`, so a max-rank ties them and the cap k
 | E0 | P1 | Empty predictions (all singletons) | = train singleton share | | | baseline |
 | E1 | P1 | `run_pipeline.py` baseline (3-view TF-IDF blocking, 28 features, LGBM, t on OOF, one-to-one) | not measured (25 Sep full run killed at training: swapping on 16 GB) | | | superseded by run-final-v1 |
 | E2 | P1 | Blocking cap ranked by `cos_full + cos_addr` (was `max` of 3 cosines), cap 40 → 80. Full-haystack diagnostic, 10k S1 per country vs the full group | **not CV** — blocking only. Oracle macro-F0.5 (perfect matcher on candidates), US: 0.9713 → **0.9952** | | recall/cover India 0.823/0.656 → 0.943/0.852; US 0.929/0.836 → 0.985/0.955 | **ADOPT** in run-final-v1 |
+| E6 | P1 | **v1 full-scale run** (tag `run-final-v1`, 8 vCPU / 67 GB GCP VM) | **CV macro-F0.5 (cross-fitted) 0.9491** — folds 0.9491 / 0.9488 / 0.9492 / 0.9490 / 0.9493, threshold 0.65 on every fold | LOCO: India held out 0.9295, US held out 0.9629 | pair P 0.983 / R 0.902; blocking recall ceiling 0.9677, entity cover 0.9121 (oracle ~0.989) | **SUBMIT** — the final submission |
+| E7 | P1 | Decision-layer rules on v1's real OOF (`scripts/redecide.py`, same cross-fitted protocol) | threshold 0.94910 (reproduces E6 exactly); commit-best-for-empties 0.94834 (0/5 folds); relative a=0.7 t=0.6 0.94912 (+0.00002, 3/5) | | loss is model discrimination: 348k true pairs scored below t, ~88k entities with no candidate >= 0.15 | **REJECT** both — noise or worse; v1 uploaded unchanged |
 | E5 | P1 | **v2 blocking** (tag `run-final-v2`): asymmetric address keys, S1 indexed under 8 rare address tokens, S2/S3 under 2; cap 100; cap on integer positions | **not CV** — oracle F0.5 at cap 100: India 0.9795 → **0.9864**, US 0.9953 → **0.9957** (blended ~0.990 before France) | | pre-cap cands/S1 India 77 → 204, US 83 → 133; India misses were address-only (S2/S3 name empty, short address), US misses mostly name-based | **ADOPT** — running on the 16-core VM |
 | E4 | P1 | India address rare tokens 2 → 3 / 4 (full haystack, 10k S1), oracle macro-F0.5 | **not CV** — India oracle: old config 0.914, v1 **0.979**, +3 addr tokens 0.982, +4 addr tokens 0.984 (cap 80) / 0.9844 (cap 100) | | pre-cap cands/S1 77 → 95 → 113; block loop 2.1–2.2× slower | **DEFER**: +0.002 overall for +2–3 h and +45% pairs; candidate for a hedge run on a second machine only |
 | E3 | P1 | LightGBM `learning_rate` 0.1 vs 0.05, 3M real candidate pairs, fold 0 held out | **not CV** — pair-level: logloss 0.01615 vs 0.01602, AP 0.99357 vs 0.99367 | | rounds to early stop 859 vs 1702 | **ADOPT 0.1**: same quality within 0.0001 AP, half the trees (prediction time ∝ trees) |
@@ -165,6 +167,7 @@ Two supporting measurements from the same run:
 | Slot | Time (IST) | Git tag | Description | CV | Public LB | Validator PASS | Keep for final? |
 |---|---|---|---|---|---|---|---|
 | D1-1 | 25 Sep 16:49 | `sub-D1-1` | Empty-prediction baseline (format check) | n/a | **0.056** | PASS (`--check-ids`) | no |
+| D2-1 | 27 Sep 11:50 | `sub-D2-1` | v1 full-scale pipeline (tag `run-final-v1`): v1 blocking fix, memory-safe resumable run | **0.9491** | **0.937** | PASS (`--check-ids`) + audit PASS | **yes — final** |
 | D1-2 | | | Rule-based fuzzy baseline | | | | |
 | D1-3 | | | First LightGBM matcher + OOF threshold | | | | |
 | D1-4 | | | + one-to-one assignment / conflict resolution | | | | |
@@ -174,6 +177,8 @@ Two supporting measurements from the same run:
 | D3-4, D3-5 | | | **Reserved:** final best-CV + hedge. Upload before 22:00 IST | | | | |
 
 Rules: never spend an upload on a threshold or hyperparameter nudge.
+
+**D2-1 result, 27 Sep:** public 0.937 vs CV 0.9491 (-0.012). Checked in AGENTS §8 order: submission bug ruled out (audit + validator PASS, hash matches), metric mismatch ruled out (D1-1 hit the predicted 0.056), leakage ruled out (line-by-line check 27 Sep; leakage would push CV above LB, not below), so train/test shift: France is 15% of test and unseen in train, and LOCO measured an unseen country at 0.930 vs 0.949 in-country. Consistent with that plus public-subset noise.
 
 **D1-1 result, 25 Sep:** predicted ≈ 0.056 from the train singleton share (123,247 / 2,206,821 = 5.585%); the portal returned **0.056**. Three things confirmed: the upload path and file format are accepted, the public subset matches train on singleton share, and our local metric maps onto the official scorer. Leaderboard context the same day: 1st 0.985884, 2nd 0.984644, 3rd 0.98435, 8th 0.982 — the whole top eight spans 0.0039, so the contest lives in the 0.98+ band and the decision layer is where it is won. A public-LB difference below noise is not evidence.
 

@@ -1,0 +1,19 @@
+RUN SUMMARY -- Amazon ML Challenge 2026, business entity resolution
+written 2026-09-27 05:28:49 | git 180614f | runtime 19.78 h | machine {'ram_total_gb': 67.4, 'disk_free_gb': 94.9, 'cpus': 8, 'python': '3.12.3'}
+
+CV macro-F0.5 (cross-fitted, the honest number) : 0.9491
+  per fold                                      : [0.9491, 0.9488, 0.9492, 0.949, 0.9493]
+  OOF pair precision / recall                   : 0.9833 / 0.9018
+  threshold used for test                       : 0.65
+  LOCO hold-out india                            : 0.9295
+  LOCO hold-out us                               : 0.9629
+train blocking recall ceiling / entity cover    : 0.9677 / 0.9121  (71.2 cands/S1)
+
+test S1 rows 1,732,544 | candidate pairs 122,251,746 | non-empty predictions 0.939 (train OOF 0.937)
+test countries: {'india': 809986, 'us': 663106, 'france': 259452}
+output check: {'rows': 1732544, 'nonempty_rows': 1626387, 'matched_ids': 5579264, 'candidate_ids': 122251746}
+official validator exit code: 0
+
+FILES TO HAND TO P1 FOR UPLOAD (verify the hashes on the receiving machine):
+  matching_results.tsv  sha256 ee98702671b46e2d94a705e706fda0b262b8242cdcc1258a7aaadfa16f792f03
+  candidate_pairs.tsv  sha256 2ae5f9d6043833c9599874afc6434d0ffdab651aa055e41a8837789751d9542f
