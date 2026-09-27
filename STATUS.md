@@ -2,7 +2,7 @@
 
 _Monitor updates the header line every 6–8 h; everyone else appends rows._
 
-**Now:** Day 1 · phase = baseline · next upload = D1-1 (empty) · blockers: none
+**Now:** Day 3, 27 Sep 22:20 IST · phase = **final package** · submitted: **D2-1, public 0.937, cross-fitted CV 0.9491** (tag `sub-D2-1` / `run-final-v1`) · final zip built and verified at `C:mlcmlc_team_submission.zip` (708 MB) · blockers: none
 
 **Problem:** Business Entity Resolution. For each Source 1 (S1) entity, list the matching S2/S3 `entity_id`s.
 **Metric:** F0.5 per S1 entity, macro-averaged over **all** S1 entities, including singletons. An empty prediction on a true singleton scores 1.0; any false match on a singleton scores 0.0.
