@@ -109,15 +109,25 @@ def measure(data: str, max_block: int):
         print(f"    entities with a hit  {m.loc[hit, 'id_s1'].nunique():,}", flush=True)
 
 
-def apply(data: str, out: str, key: str, max_block: int):
-    """Add the join's pairs to BOTH output files, respecting one-to-one."""
+def apply(data: str, out: str, key: str, max_block: int, pairs_file: str | None = None):
+    """Add the join's pairs to BOTH output files, respecting one-to-one.
+
+    `pairs_file` skips the join and uses a precomputed two-column TSV
+    (source1_entity_id, matched_entity_id). Normalising 11.7M test records takes
+    about ten minutes, so on a deadline it is worth computing once and reusing.
+    """
     t1 = read_tsv(os.path.join(data, "test", "test_source1.tsv"))
-    t23 = pd.concat([read_tsv(os.path.join(data, "test", f"test_source{k}.tsv"))
-                     for k in (2, 3)], ignore_index=True)
-    k1, k2 = build_keys(t1, "test S1"), build_keys(t23, "test S2/S3")
-    del t23
-    cols = ["k_pc", "k_ad"] if key == "both" else [key]
-    new = pd.concat([join(k1, k2, c, max_block) for c in cols], ignore_index=True).drop_duplicates()
+    if pairs_file:
+        pre = read_tsv(pairs_file)
+        new = pre.rename(columns={pre.columns[0]: "id_s1", pre.columns[1]: "id_s23"})[["id_s1", "id_s23"]]
+        log(f"loaded {len(new):,} precomputed pairs from {pairs_file}")
+    else:
+        t23 = pd.concat([read_tsv(os.path.join(data, "test", f"test_source{k}.tsv"))
+                         for k in (2, 3)], ignore_index=True)
+        k1, k2 = build_keys(t1, "test S1"), build_keys(t23, "test S2/S3")
+        del t23
+        cols = ["k_pc", "k_ad"] if key == "both" else [key]
+        new = pd.concat([join(k1, k2, c, max_block) for c in cols], ignore_index=True).drop_duplicates()
     log(f"join proposes {len(new):,} pairs over {new['id_s1'].nunique():,} entities")
 
     mpath = os.path.join(out, "matching_results.tsv")
@@ -160,11 +170,14 @@ def main():
     ap.add_argument("--key", default="both", choices=["k_pc", "k_ad", "both"])
     ap.add_argument("--max-block", type=int, default=50,
                     help="drop keys shared by more than this many records on a side")
+    ap.add_argument("--pairs", default=None,
+                    help="use a precomputed two-column TSV of pairs instead of joining "
+                         "(saves ~10 min of normalising 11.7M test records)")
     a = ap.parse_args()
     if a.measure:
         measure(a.data, a.max_block)
     if a.apply:
-        apply(a.data, a.out, a.key, a.max_block)
+        apply(a.data, a.out, a.key, a.max_block, a.pairs)
     if not (a.measure or a.apply):
         ap.error("pass --measure or --apply")
 
