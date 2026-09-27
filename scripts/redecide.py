@@ -98,7 +98,7 @@ def main():
     candidates = {
         "threshold": (lambda d, g: apply_rule(d, g, True), t_grid),
         "top1": (lambda d, g: apply_top1(d, g[0], g[1], True),
-                 [(t, f) for t in (0.6, 0.65, 0.7, 0.75) for f in (0.05, 0.1, 0.2, 0.3, 0.4)]),
+                 [(t, f) for t in (0.6, 0.65, 0.7, 0.75) for f in (0.15, 0.2, 0.3, 0.4, 0.5)]),
         "relative": (lambda d, g: apply_relative_rule(d, g[0], g[1], True),
                      [(t, a) for t in (0.5, 0.6) for a in (0.3, 0.5, 0.7)]),
     }
